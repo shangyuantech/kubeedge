@@ -4,10 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"k8s.io/apimachinery/pkg/util/httpstream/spdy"
-	"k8s.io/klog"
 	"net/http"
 	"net/url"
+
+	"k8s.io/apimachinery/pkg/util/httpstream/spdy"
+	"k8s.io/klog/v2"
 )
 
 type EdgedExecConnection struct {
@@ -46,7 +47,7 @@ func (r *responder) Error(w http.ResponseWriter, req *http.Request, err error) {
 }
 
 func (e *EdgedExecConnection) Serve(tunnel SafeWriteTunneler) error {
-	tripper := spdy.NewSpdyRoundTripper(nil, true, false)
+	tripper := spdy.NewRoundTripper(nil, true, false)
 	req, err := http.NewRequest(e.Method, e.URL.String(), nil)
 	if err != nil {
 		return fmt.Errorf("failed to create exec request, err: %v", err)

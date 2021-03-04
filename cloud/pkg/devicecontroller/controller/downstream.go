@@ -23,23 +23,24 @@ import (
 	"strconv"
 	"time"
 
-	uuid "github.com/satori/go.uuid"
+	"github.com/google/uuid"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/kubeedge/beehive/pkg/core/model"
 	"github.com/kubeedge/kubeedge/cloud/pkg/apis/devices/v1alpha2"
+	crdinformers "github.com/kubeedge/kubeedge/cloud/pkg/client/informers/externalversions"
+	"github.com/kubeedge/kubeedge/cloud/pkg/common/client"
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
 	"github.com/kubeedge/kubeedge/cloud/pkg/devicecontroller/constants"
 	"github.com/kubeedge/kubeedge/cloud/pkg/devicecontroller/manager"
 	"github.com/kubeedge/kubeedge/cloud/pkg/devicecontroller/messagelayer"
 	"github.com/kubeedge/kubeedge/cloud/pkg/devicecontroller/types"
-	"github.com/kubeedge/kubeedge/cloud/pkg/devicecontroller/utils"
 )
 
 // Constants for protocol, datatype, configmap, deviceProfile
@@ -66,7 +67,7 @@ const (
 
 // DownstreamController watch kubernetes api server and send change to edge
 type DownstreamController struct {
-	kubeClient   *kubernetes.Clientset
+	kubeClient   kubernetes.Interface
 	messageLayer messagelayer.MessageLayer
 
 	deviceManager      *manager.DeviceManager
@@ -176,8 +177,6 @@ func (dc *DownstreamController) addToConfigMap(device *v1alpha2.Device) {
 	configMap, ok := dc.configMapManager.ConfigMap.Load(device.Spec.NodeSelector.NodeSelectorTerms[0].MatchExpressions[0].Values[0])
 	if !ok {
 		nodeConfigMap := &v1.ConfigMap{}
-		nodeConfigMap.Kind = ConfigMapKind
-		nodeConfigMap.APIVersion = ConfigMapVersion
 		nodeConfigMap.Name = DeviceProfileConfigPrefix + device.Spec.NodeSelector.NodeSelectorTerms[0].MatchExpressions[0].Values[0]
 		nodeConfigMap.Namespace = device.Namespace
 		nodeConfigMap.Data = make(map[string]string)
@@ -277,25 +276,25 @@ func addDeviceModelAndVisitors(deviceModel *v1alpha2.DeviceModel, deviceProfile 
 			property.DataType = DataTypeString
 			property.DefaultValue = ppt.Type.String.DefaultValue
 		} else if ppt.Type.Double != nil {
-			property.AccessMode = string(ppt.Type.Int.AccessMode)
+			property.AccessMode = string(ppt.Type.Double.AccessMode)
 			property.DataType = DataTypeDouble
 			property.DefaultValue = ppt.Type.Double.DefaultValue
 			property.Maximum = ppt.Type.Double.Maximum
 			property.Minimum = ppt.Type.Double.Minimum
 			property.Unit = ppt.Type.Double.Unit
 		} else if ppt.Type.Float != nil {
-			property.AccessMode = string(ppt.Type.Int.AccessMode)
+			property.AccessMode = string(ppt.Type.Float.AccessMode)
 			property.DataType = DataTypeFloat
 			property.DefaultValue = ppt.Type.Float.DefaultValue
 			property.Maximum = ppt.Type.Float.Maximum
 			property.Minimum = ppt.Type.Float.Minimum
 			property.Unit = ppt.Type.Float.Unit
 		} else if ppt.Type.Boolean != nil {
-			property.AccessMode = string(ppt.Type.String.AccessMode)
+			property.AccessMode = string(ppt.Type.Boolean.AccessMode)
 			property.DataType = DataTypeBoolean
-			property.DefaultValue = ppt.Type.String.DefaultValue
+			property.DefaultValue = ppt.Type.Boolean.DefaultValue
 		} else if ppt.Type.Bytes != nil {
-			property.AccessMode = string(ppt.Type.String.AccessMode)
+			property.AccessMode = string(ppt.Type.Bytes.AccessMode)
 			property.DataType = DataTypeBytes
 		}
 		model.Properties = append(model.Properties, property)
@@ -402,7 +401,7 @@ func (dc *DownstreamController) deviceAdded(device *v1alpha2.Device) {
 		content := types.MembershipUpdate{AddDevices: []types.Device{
 			edgeDevice,
 		}}
-		content.EventID = uuid.NewV4().String()
+		content.EventID = uuid.New().String()
 		content.Timestamp = time.Now().UnixNano() / 1e6
 		msg.Content = content
 
@@ -489,6 +488,11 @@ func isDeviceDataUpdated(oldData *v1alpha2.DeviceData, newData *v1alpha2.DeviceD
 	return !reflect.DeepEqual(oldData, newData)
 }
 
+// isDevicePropertyVisitorsUpdated checks if DeviceProperyVisitors is updated
+func isDevicePropertyVisitorsUpdated(oldPropertyVisitors *[]v1alpha2.DevicePropertyVisitor, newPropertyVisitors *[]v1alpha2.DevicePropertyVisitor) bool {
+	return !reflect.DeepEqual(oldPropertyVisitors, newPropertyVisitors)
+}
+
 // updateConfigMap updates the protocol, twins and data in the deviceProfile in configmap
 func (dc *DownstreamController) updateConfigMap(device *v1alpha2.Device) {
 	if len(device.Spec.NodeSelector.NodeSelectorTerms) != 0 && len(device.Spec.NodeSelector.NodeSelectorTerms[0].MatchExpressions) != 0 && len(device.Spec.NodeSelector.NodeSelectorTerms[0].MatchExpressions[0].Values) != 0 {
@@ -544,8 +548,10 @@ func (dc *DownstreamController) updateConfigMap(device *v1alpha2.Device) {
 		} else {
 			klog.Warning("Unsupported device protocol")
 		}
+		// add protocol common
+		deviceProtocol.ProtocolCommonConfig = device.Spec.Protocol.Common
 
-		// update the twins, data and protocol in deviceInstance
+		// update the propertyVisitors, twins, data and protocol in deviceInstance
 		for _, devInst := range deviceProfile.DeviceInstances {
 			if device.Name == devInst.Name {
 				// update property visitors
@@ -565,14 +571,14 @@ func (dc *DownstreamController) updateConfigMap(device *v1alpha2.Device) {
 
 		bytes, err := json.Marshal(deviceProfile)
 		if err != nil {
-			klog.Errorf("Failed to marshal deviceprofile: %v", deviceProfile)
+			klog.Errorf("Failed to marshal deviceprofile: %v, error: %v", deviceProfile, err)
 			return
 		}
 		nodeConfigMap.Data[DeviceProfileJSON] = string(bytes)
 		// store new config map
 		dc.configMapManager.ConfigMap.Store(device.Spec.NodeSelector.NodeSelectorTerms[0].MatchExpressions[0].Values[0], nodeConfigMap)
 		if _, err := dc.kubeClient.CoreV1().ConfigMaps(device.Namespace).Update(context.Background(), nodeConfigMap, metav1.UpdateOptions{}); err != nil {
-			klog.Errorf("Failed to update config map %v in namespace %v", nodeConfigMap, device.Namespace)
+			klog.Errorf("Failed to update config map %v in namespace %v, error: %v", nodeConfigMap, device.Namespace, err)
 			return
 		}
 	}
@@ -608,7 +614,8 @@ func (dc *DownstreamController) deviceUpdated(device *v1alpha2.Device) {
 				// update config map if spec, data or twins changed
 				if isProtocolConfigUpdated(&cachedDevice.Spec.Protocol, &device.Spec.Protocol) ||
 					isDeviceStatusUpdated(&cachedDevice.Status, &device.Status) ||
-					isDeviceDataUpdated(&cachedDevice.Spec.Data, &device.Spec.Data) {
+					isDeviceDataUpdated(&cachedDevice.Spec.Data, &device.Spec.Data) ||
+					isDevicePropertyVisitorsUpdated(&cachedDevice.Spec.PropertyVisitors, &device.Spec.PropertyVisitors) {
 					dc.updateConfigMap(device)
 				}
 				// update twin properties
@@ -626,7 +633,7 @@ func (dc *DownstreamController) deviceUpdated(device *v1alpha2.Device) {
 					}
 					msg.BuildRouter(modules.DeviceControllerModuleName, constants.GroupTwin, resource, model.UpdateOperation)
 					content := types.DeviceTwinUpdate{Twin: twin}
-					content.EventID = uuid.NewV4().String()
+					content.EventID = uuid.New().String()
 					content.Timestamp = time.Now().UnixNano() / 1e6
 					msg.Content = content
 
@@ -734,9 +741,11 @@ func (dc *DownstreamController) deleteFromConfigMap(device *v1alpha2.Device) {
 		// 1. no device bound to it, as Data[DeviceProfileJSON] is "{}"
 		// 2. device instance created alone then removed, as Data[DeviceProfileJSON] is ""
 		if nodeConfigMap.Data[DeviceProfileJSON] == "{}" || nodeConfigMap.Data[DeviceProfileJSON] == "" {
-			if err := dc.kubeClient.CoreV1().ConfigMaps(device.Namespace).Delete(context.Background(), nodeConfigMap.Name, metav1.DeleteOptions{}); err != nil {
-				klog.Errorf("failed to delete config map %s in namespace %s", nodeConfigMap.Name, device.Namespace)
-				return
+			if _, err := dc.kubeClient.CoreV1().ConfigMaps(device.Namespace).Get(context.Background(), nodeConfigMap.Name, metav1.GetOptions{}); err == nil {
+				if err = dc.kubeClient.CoreV1().ConfigMaps(device.Namespace).Delete(context.Background(), nodeConfigMap.Name, metav1.DeleteOptions{}); err != nil {
+					klog.Errorf("failed to delete config map %s in namespace %s", nodeConfigMap.Name, device.Namespace)
+					return
+				}
 			}
 			// remove from cache
 			dc.configMapManager.ConfigMap.Delete(device.Spec.NodeSelector.NodeSelectorTerms[0].MatchExpressions[0].Values[0])
@@ -842,7 +851,7 @@ func (dc *DownstreamController) deviceDeleted(device *v1alpha2.Device) {
 		content := types.MembershipUpdate{RemoveDevices: []types.Device{
 			edgeDevice,
 		}}
-		content.EventID = uuid.NewV4().String()
+		content.EventID = uuid.New().String()
 		content.Timestamp = time.Now().UnixNano() / 1e6
 		msg.Content = content
 		if err != nil {
@@ -871,38 +880,21 @@ func (dc *DownstreamController) Start() error {
 }
 
 // NewDownstreamController create a DownstreamController from config
-func NewDownstreamController() (*DownstreamController, error) {
-	cli, err := utils.KubeClient()
-	if err != nil {
-		klog.Warningf("Create kube client failed with error: %s", err)
-		return nil, err
-	}
-
-	config, err := utils.KubeConfig()
-	if err != nil {
-		klog.Warningf("Get kubeConfig error: %v", err)
-		return nil, err
-	}
-
-	crdcli, err := utils.NewCRDClient(config)
-	if err != nil {
-		klog.Warningf("Failed to create crd client: %s", err)
-		return nil, err
-	}
-	deviceManager, err := manager.NewDeviceManager(crdcli, v1.NamespaceAll)
+func NewDownstreamController(crdInformerFactory crdinformers.SharedInformerFactory) (*DownstreamController, error) {
+	deviceManager, err := manager.NewDeviceManager(crdInformerFactory.Devices().V1alpha2().Devices().Informer())
 	if err != nil {
 		klog.Warningf("Create device manager failed with error: %s", err)
 		return nil, err
 	}
 
-	deviceModelManager, err := manager.NewDeviceModelManager(crdcli, v1.NamespaceAll)
+	deviceModelManager, err := manager.NewDeviceModelManager(crdInformerFactory.Devices().V1alpha2().DeviceModels().Informer())
 	if err != nil {
 		klog.Warningf("Create device manager failed with error: %s", err)
 		return nil, err
 	}
 
 	dc := &DownstreamController{
-		kubeClient:         cli,
+		kubeClient:         client.GetKubeClient(),
 		deviceManager:      deviceManager,
 		deviceModelManager: deviceModelManager,
 		messageLayer:       messagelayer.NewContextMessageLayer(),

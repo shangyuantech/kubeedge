@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"github.com/gorilla/websocket"
 	"github.com/kubeedge/beehive/pkg/core/model"
@@ -114,8 +114,8 @@ func (conn *WSConnection) handleRawData() {
 }
 
 func (conn *WSConnection) handleMessage() {
-	msg := &model.Message{}
 	for {
+		msg := &model.Message{}
 		err := lane.NewLane(api.ProtocolTypeWS, conn.wsConn).ReadMessage(msg)
 		if err != nil {
 			if err != io.EOF {

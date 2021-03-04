@@ -84,9 +84,6 @@ func addJoinOtherFlags(cmd *cobra.Command, joinOptions *types.JoinOptions) {
 		"Use this key to download and use the required KubeEdge version")
 	cmd.Flags().Lookup(types.KubeEdgeVersion).NoOptDefVal = joinOptions.KubeEdgeVersion
 
-	cmd.Flags().StringVar(&joinOptions.InterfaceName, types.InterfaceName, joinOptions.InterfaceName,
-		"KubeEdge Node interface name string, the default value is eth0")
-
 	cmd.Flags().StringVar(&joinOptions.CGroupDriver, types.CGroupDriver, joinOptions.CGroupDriver,
 		"CGroupDriver that uses to manipulate cgroups on the host (cgroupfs or systemd), the default value is cgroupfs")
 
@@ -114,6 +111,9 @@ func addJoinOtherFlags(cmd *cobra.Command, joinOptions *types.JoinOptions) {
 
 	cmd.Flags().StringVarP(&joinOptions.CertPort, types.CertPort, "s", joinOptions.CertPort,
 		"The port where to apply for the edge certificate")
+
+	cmd.Flags().StringVar(&joinOptions.TarballPath, types.TarballPath, joinOptions.TarballPath,
+		"Use this key to set the temp directory path for KubeEdge tarball, if not exist, download it")
 }
 
 // newJoinOptions returns a struct ready for being used for creating cmd join flags.
@@ -158,12 +158,12 @@ func Add2ToolsList(toolList map[string]types.ToolsInstaller, flagData map[string
 		CloudCoreIP:           joinOptions.CloudCoreIPPort,
 		EdgeNodeName:          joinOptions.EdgeNodeName,
 		RuntimeType:           joinOptions.RuntimeType,
-		InterfaceName:         joinOptions.InterfaceName,
 		CertPath:              joinOptions.CertPath,
 		RemoteRuntimeEndpoint: joinOptions.RemoteRuntimeEndpoint,
 		Token:                 joinOptions.Token,
 		CertPort:              joinOptions.CertPort,
 		CGroupDriver:          joinOptions.CGroupDriver,
+		TarballPath:           joinOptions.TarballPath,
 	}
 
 	toolList["MQTT"] = &util.MQTTInstTool{}

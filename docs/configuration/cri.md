@@ -2,7 +2,7 @@
 
 ## containerd
 
-Docker 18.09 ships with `containerd`, so you should not need to install it manually. If you do not have `containerd`, you may install it by running the following:
+Docker 18.09 and up ship with `containerd`, so you should not need to install it manually. If you do not have `containerd`, you may install it by running the following:
 
 ```bash
 # Install containerd
@@ -69,9 +69,9 @@ NOTE: since cri doesn't support multi-tenancy while `containerd` does, the names
 
 ## CRI-O
 
-Follow the [CRI-O install guide](https://github.com/cri-o/cri-o/blob/master/tutorials/setup.md) to setup CRI-O.
+Follow the [CRI-O install guide](https://github.com/cri-o/cri-o/blob/master/install.md) to setup CRI-O.
 
-If your edge node is running on the ARM platform and your distro is ubuntu18.04, you might need to build the binaries form source and then install, since CRI-O packages are not available in the [Kubic](https://build.opensuse.org/project/show/devel:kubic:libcontainers:stable) repository for this combination.
+If your edge node is running on the ARM platform and your distro is ubuntu18.04, you might need to build the binaries from source and then install, since CRI-O packages are not available in the [Kubic](https://build.opensuse.org/project/show/devel:kubic:libcontainers:stable) repository for this combination.
 
 ```bash
 git clone https://github.com/cri-o/cri-o
