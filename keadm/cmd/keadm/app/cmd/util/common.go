@@ -63,6 +63,8 @@ const (
 
 	EdgeRootDir = "/var/lib/edged"
 
+	SystemdBootPath = "/run/systemd/system"
+
 	KubeEdgeCRDDownloadURL = "https://raw.githubusercontent.com/kubeedge/kubeedge/master/build/crds"
 
 	latestReleaseVersionURL = "https://kubeedge.io/latestversion"
@@ -305,7 +307,7 @@ func installKubeEdge(options types.InstallOptions, arch string, version semver.V
 		fmt.Println(cmd.GetStdOut())
 	} else if options.ComponentType == types.EdgeCore {
 		untarFileAndMoveEdgeCore = fmt.Sprintf("cd %s && tar -C %s -xvzf %s && cp %s/%s/edge/%s %s/",
-			options.TarballPath, options.TarballPath, filename, options.TarballPath, dirname, KubeEdgeBinaryName, KubeEdgePath)
+			options.TarballPath, options.TarballPath, filename, options.TarballPath, dirname, KubeEdgeBinaryName, KubeEdgeUsrBinPath)
 		cmd := NewCommand(untarFileAndMoveEdgeCore)
 		if err := cmd.Exec(); err != nil {
 			return err
@@ -420,14 +422,20 @@ func isEdgeCoreServiceRunning(serviceName string) (bool, error) {
 }
 
 // check if systemd exist
+// if command run failed, then check it by sd_booted
 func hasSystemd() bool {
 	cmd := "file /sbin/init"
 
-	if err := NewCommand(cmd).Exec(); err != nil {
+	if err := NewCommand(cmd).Exec(); err == nil {
+		return true
+	}
+	// checks whether `SystemdBootPath` exists and is a directory
+	// reference http://www.freedesktop.org/software/systemd/man/sd_booted.html
+	fi, err := os.Lstat(SystemdBootPath)
+	if err != nil {
 		return false
 	}
-
-	return true
+	return fi.IsDir()
 }
 
 func checkSum(filename, checksumFilename string, version semver.Version, tarballPath string) (bool, error) {
