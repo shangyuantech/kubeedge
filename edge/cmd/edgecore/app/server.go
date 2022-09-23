@@ -3,17 +3,18 @@ package app
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 
 	"github.com/mitchellh/go-ps"
 	"github.com/spf13/cobra"
+	netutil "k8s.io/apimachinery/pkg/util/net"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/cli/globalflag"
 	"k8s.io/component-base/term"
 	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/beehive/pkg/core"
-	"github.com/kubeedge/kubeedge/common/constants"
 	"github.com/kubeedge/kubeedge/edge/cmd/edgecore/app/options"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/dbm"
 	"github.com/kubeedge/kubeedge/edge/pkg/devicetwin"
@@ -24,9 +25,9 @@ import (
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager"
 	"github.com/kubeedge/kubeedge/edge/pkg/servicebus"
 	"github.com/kubeedge/kubeedge/edge/test"
-	edgemesh "github.com/kubeedge/kubeedge/edgemesh/pkg"
 	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha1"
 	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha1/validation"
+	"github.com/kubeedge/kubeedge/pkg/features"
 	"github.com/kubeedge/kubeedge/pkg/util"
 	"github.com/kubeedge/kubeedge/pkg/util/flag"
 	"github.com/kubeedge/kubeedge/pkg/version"
@@ -56,16 +57,19 @@ offering HTTP client capabilities to components of cloud to reach HTTP servers r
 			flag.PrintFlags(cmd.Flags())
 
 			if errs := opts.Validate(); len(errs) > 0 {
-				klog.Fatal(util.SpliceErrors(errs))
+				klog.Exit(util.SpliceErrors(errs))
 			}
 
 			config, err := opts.Config()
 			if err != nil {
-				klog.Fatal(err)
+				klog.Exit(err)
+			}
+			if errs := validation.ValidateEdgeCoreConfiguration(config); len(errs) > 0 {
+				klog.Exit(util.SpliceErrors(errs.ToAggregate().Errors()))
 			}
 
-			if errs := validation.ValidateEdgeCoreConfiguration(config); len(errs) > 0 {
-				klog.Fatal(util.SpliceErrors(errs.ToAggregate().Errors()))
+			if err := features.DefaultMutableFeatureGate.SetFromMap(config.FeatureGates); err != nil {
+				klog.Exit(err)
 			}
 
 			// To help debugging, immediately log version
@@ -80,18 +84,35 @@ offering HTTP client capabilities to components of cloud to reach HTTP servers r
 			if checkEnv != "false" {
 				// Check running environment before run edge core
 				if err := environmentCheck(); err != nil {
-					klog.Fatal(fmt.Errorf("Failed to check the running environment: %v", err))
+					klog.Exit(fmt.Errorf("failed to check the running environment: %v", err))
 				}
 			}
 
-			// get edge node local ip
-			if config.Modules.Edged.NodeIP == "" {
-				hostnameOverride, err := os.Hostname()
+			// Get edge node local ip only when the customInterfaceName has been set.
+			// Defaults to the local IP from the default interface by the default config
+			if config.Modules.Edged.CustomInterfaceName != "" {
+				ip, err := netutil.ChooseBindAddressForInterface(config.Modules.Edged.CustomInterfaceName)
 				if err != nil {
-					hostnameOverride = constants.DefaultHostnameOverride
+					klog.Errorf("Failed to get IP address by custom interface %s, err: %v", config.Modules.Edged.CustomInterfaceName, err)
+					os.Exit(1)
 				}
-				localIP, _ := util.GetLocalIP(hostnameOverride)
-				config.Modules.Edged.NodeIP = localIP
+				config.Modules.Edged.NodeIP = ip.String()
+				klog.Infof("Get IP address by custom interface successfully, %s: %s", config.Modules.Edged.CustomInterfaceName, config.Modules.Edged.NodeIP)
+			} else {
+				if net.ParseIP(config.Modules.Edged.NodeIP) != nil {
+					klog.Infof("Use node IP address from config: %s", config.Modules.Edged.NodeIP)
+				} else if config.Modules.Edged.NodeIP != "" {
+					klog.Errorf("invalid node IP address specified: %s", config.Modules.Edged.NodeIP)
+					os.Exit(1)
+				} else {
+					nodeIP, err := util.GetLocalIP(util.GetHostname())
+					if err != nil {
+						klog.Errorf("Failed to get Local IP address: %v", err)
+						os.Exit(1)
+					}
+					config.Modules.Edged.NodeIP = nodeIP
+					klog.Infof("Get node local IP address successfully: %s", nodeIP)
+				}
 			}
 
 			registerModules(config)
@@ -132,12 +153,10 @@ func environmentCheck() error {
 	}
 
 	for _, process := range processes {
-		// if kubelet is running, return error
-		if process.Executable() == "kubelet" {
+		switch process.Executable() {
+		case "kubelet": // if kubelet is running, return error
 			return errors.New("kubelet should not running on edge node when running edgecore")
-		}
-		// if kube-proxy is running, return error
-		if process.Executable() == "kube-proxy" {
+		case "kube-proxy": // if kube-proxy is running, return error
 			return errors.New("kube-proxy should not running on edge node when running edgecore")
 		}
 	}
@@ -151,7 +170,6 @@ func registerModules(c *v1alpha1.EdgeCoreConfig) {
 	edged.Register(c.Modules.Edged)
 	edgehub.Register(c.Modules.EdgeHub, c.Modules.Edged.HostnameOverride)
 	eventbus.Register(c.Modules.EventBus, c.Modules.Edged.HostnameOverride)
-	edgemesh.Register(c.Modules.EdgeMesh)
 	metamanager.Register(c.Modules.MetaManager)
 	servicebus.Register(c.Modules.ServiceBus)
 	edgestream.Register(c.Modules.EdgeStream, c.Modules.Edged.HostnameOverride, c.Modules.Edged.NodeIP)

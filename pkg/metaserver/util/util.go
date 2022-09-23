@@ -1,7 +1,6 @@
 package util
 
 import (
-	"fmt"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -14,10 +13,6 @@ import (
 	"k8s.io/klog/v2"
 
 	beehiveModel "github.com/kubeedge/beehive/pkg/core/model"
-)
-
-const (
-	EmptyString = ""
 )
 
 // MetaType is generally consisted of apiversion, kind like:
@@ -34,7 +29,7 @@ func SetMetaType(obj runtime.Object) error {
 	//gvr,_,_ := apiserverlite.ParseKey(accessor.GetSelfLink())
 	kinds, _, err := scheme.Scheme.ObjectKinds(obj)
 	if err != nil {
-		return fmt.Errorf("%v", err)
+		return err
 	}
 	gvk := kinds[0]
 	obj.GetObjectKind().SetGroupVersionKind(gvk)
@@ -50,9 +45,14 @@ func UnsafeResourceToKind(r string) string {
 		return r
 	}
 	unusualResourceToKind := map[string]string{
-		"endpoints": "Endpoints",
-		"nodes":     "Node",
-		"services":  "Service",
+		"endpoints":                    "Endpoints",
+		"endpointslices":               "EndpointSlice",
+		"nodes":                        "Node",
+		"services":                     "Service",
+		"podstatus":                    "PodStatus",
+		"nodestatus":                   "NodeStatus",
+		"customresourcedefinitions":    "CustomResourceDefinition",
+		"customresourcedefinitionlist": "CustomResourceDefinitionList",
 	}
 	if v, isUnusual := unusualResourceToKind[r]; isUnusual {
 		return v
@@ -74,7 +74,11 @@ func UnsafeKindToResource(k string) string {
 		return k
 	}
 	unusualKindToResource := map[string]string{
-		"Endpoints": "endpoints",
+		"Endpoints":                    "endpoints",
+		"PodStatus":                    "podstatus",
+		"NodeStatus":                   "nodestatus",
+		"CustomResourceDefinition":     "customresourcedefinitions",
+		"CustomResourceDefinitionList": "customresourcedefinitionlist",
 	}
 	if v, isUnusual := unusualKindToResource[k]; isUnusual {
 		return v
@@ -118,7 +122,7 @@ func UnstructuredAttr(obj runtime.Object) (labels.Set, fields.Set, error) {
 }
 
 // GetMessageUID returns the UID of the object in message
-func GetMessageAPIVerison(msg *beehiveModel.Message) string {
+func GetMessageAPIVersion(msg *beehiveModel.Message) string {
 	obj, ok := msg.Content.(runtime.Object)
 	if ok {
 		return obj.GetObjectKind().GroupVersionKind().GroupVersion().String()
@@ -130,7 +134,7 @@ func GetMessageAPIVerison(msg *beehiveModel.Message) string {
 func GetMessageResourceType(msg *beehiveModel.Message) string {
 	obj, ok := msg.Content.(runtime.Object)
 	if ok {
-		return UnsafeKindToResource(obj.GetObjectKind().GroupVersionKind().Kind)
+		return obj.GetObjectKind().GroupVersionKind().Kind
 	}
 	return ""
 }

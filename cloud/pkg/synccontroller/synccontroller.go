@@ -16,14 +16,14 @@ import (
 
 	"github.com/kubeedge/beehive/pkg/core"
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
-	"github.com/kubeedge/kubeedge/cloud/pkg/apis/reliablesyncs/v1alpha1"
-	crdClientset "github.com/kubeedge/kubeedge/cloud/pkg/client/clientset/versioned"
-	reliablesyncslisters "github.com/kubeedge/kubeedge/cloud/pkg/client/listers/reliablesyncs/v1alpha1"
 	keclient "github.com/kubeedge/kubeedge/cloud/pkg/common/client"
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/informers"
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
 	"github.com/kubeedge/kubeedge/cloud/pkg/synccontroller/config"
 	configv1alpha1 "github.com/kubeedge/kubeedge/pkg/apis/componentconfig/cloudcore/v1alpha1"
+	"github.com/kubeedge/kubeedge/pkg/apis/reliablesyncs/v1alpha1"
+	crdClientset "github.com/kubeedge/kubeedge/pkg/client/clientset/versioned"
+	reliablesyncslisters "github.com/kubeedge/kubeedge/pkg/client/listers/reliablesyncs/v1alpha1"
 )
 
 // SyncController use beehive context message layer
@@ -40,6 +40,8 @@ type SyncController struct {
 
 	informersSyncedFuncs []cache.InformerSynced
 }
+
+var _ core.Module = (*SyncController)(nil)
 
 func newSyncController(enable bool) *SyncController {
 	var sctl = &SyncController{
@@ -106,7 +108,7 @@ func (sctl *SyncController) Start() {
 func (sctl *SyncController) reconcile() {
 	allClusterObjectSyncs, err := sctl.clusterObjectSyncLister.List(labels.Everything())
 	if err != nil {
-		klog.Errorf("Filed to list all the ClusterObjectSyncs: %v", err)
+		klog.Errorf("Failed to list all the ClusterObjectSyncs: %v", err)
 	}
 	sctl.manageClusterObjectSync(allClusterObjectSyncs)
 
@@ -115,8 +117,6 @@ func (sctl *SyncController) reconcile() {
 		klog.Errorf("Failed to list all the ObjectSyncs: %v", err)
 	}
 	sctl.manageObjectSync(allObjectSyncs)
-
-	sctl.manageCreateFailedObject()
 }
 
 // Compare the cluster scope objects that have been persisted to the edge with the cluster scope objects in K8s,
@@ -143,6 +143,7 @@ func (sctl *SyncController) deleteObjectSyncs() {
 		isGarbage, err := sctl.checkObjectSync(sync)
 		if err != nil {
 			klog.Errorf("failed to check ObjectSync outdated, %s", err)
+			continue
 		}
 		if isGarbage {
 			klog.Infof("ObjectSync %s will be deleted since node %s has been deleted", sync.Name, nodeName)

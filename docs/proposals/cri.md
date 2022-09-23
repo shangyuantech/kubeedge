@@ -65,7 +65,6 @@ for docker runtime using dockershim is not considered in edged
 ## High Level Design
 
 ### Edged with CRI support
-<img src="../images/edged/docker-cri.png">
 
 ## Low Level Design
 
@@ -171,7 +170,7 @@ func getConfig() *Config {
 		Get remote runtime endpoint and set to /var/run/containerd/container.sock if not provided
 		Get remote image endpoint and set same as remote runtime endpoint of not provided
                 Get runtime Request Timeout and set to default of 2 min if not provided
-                Get PodSandboxImage and set to k8s.gcr.io/pause
+                Get PodSandboxImage and set to kubeedge/pause
  	....
 }
 

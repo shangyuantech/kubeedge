@@ -23,7 +23,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os/exec"
 	"reflect"
@@ -31,17 +30,20 @@ import (
 	"time"
 
 	MQTT "github.com/eclipse/paho.mqtt.golang"
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
-	"github.com/pkg/errors"
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 
-	"github.com/kubeedge/kubeedge/cloud/pkg/apis/devices/v1alpha2"
 	"github.com/kubeedge/kubeedge/common/constants"
+	"github.com/kubeedge/kubeedge/pkg/apis/devices/v1alpha2"
 	"github.com/kubeedge/viaduct/pkg/api"
 )
 
@@ -126,6 +128,12 @@ type DeviceTwinResult struct {
 	Twin map[string]*MsgTwin `json:"twin"`
 }
 
+type ServicebusResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Body string `json:"body"`
+}
+
 // Function to get nginx deployment spec
 func nginxDeploymentSpec(imgURL, selector string, replicas int) *apps.DeploymentSpec {
 	var nodeselector map[string]string
@@ -175,12 +183,12 @@ func edgecoreDeploymentSpec(imgURL, configmap string, replicas int) *apps.Deploy
 						ImagePullPolicy: v1.PullPolicy("IfNotPresent"),
 						Resources: v1.ResourceRequirements{
 							Requests: v1.ResourceList{
-								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("200m"),
-								v1.ResourceName(v1.ResourceMemory): resource.MustParse("100Mi"),
+								v1.ResourceCPU:    resource.MustParse("200m"),
+								v1.ResourceMemory: resource.MustParse("100Mi"),
 							},
 							Limits: v1.ResourceList{
-								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("200m"),
-								v1.ResourceName(v1.ResourceMemory): resource.MustParse("100Mi"),
+								v1.ResourceCPU:    resource.MustParse("200m"),
+								v1.ResourceMemory: resource.MustParse("100Mi"),
 							},
 						},
 						Env:          []v1.EnvVar{{Name: "DOCKER_HOST", Value: "tcp://localhost:2375"}},
@@ -191,8 +199,8 @@ func edgecoreDeploymentSpec(imgURL, configmap string, replicas int) *apps.Deploy
 						Image:           "docker:dind",
 						Resources: v1.ResourceRequirements{
 							Requests: v1.ResourceList{
-								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("20m"),
-								v1.ResourceName(v1.ResourceMemory): resource.MustParse("256Mi"),
+								v1.ResourceCPU:    resource.MustParse("20m"),
+								v1.ResourceMemory: resource.MustParse("256Mi"),
 							},
 						},
 						VolumeMounts: []v1.VolumeMount{{Name: "docker-graph-storage", MountPath: "/var/lib/docker"}},
@@ -231,8 +239,8 @@ func cloudcoreDeploymentSpec(imgURL, configmap string, replicas int) *apps.Deplo
 						ImagePullPolicy: v1.PullPolicy("IfNotPresent"),
 						Resources: v1.ResourceRequirements{
 							Requests: v1.ResourceList{
-								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("100m"),
-								v1.ResourceName(v1.ResourceMemory): resource.MustParse("512Mi"),
+								v1.ResourceCPU:    resource.MustParse("100m"),
+								v1.ResourceMemory: resource.MustParse("512Mi"),
 							},
 						},
 						Ports:        portInfo,
@@ -268,7 +276,7 @@ func newDeployment(cloudcore, edgecore bool, name, imgURL, nodeselector, configm
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Labels:    map[string]string{"app": constants.KubeEdge},
+			Labels:    map[string]string{"app": constants.SystemName},
 			Namespace: namespace,
 		},
 		Spec: *depObj,
@@ -299,8 +307,12 @@ func NewPodObj(podName, imgURL, nodeselector string) *v1.Pod {
 // GetDeployments to get the deployments list
 func GetDeployments(list *apps.DeploymentList, getDeploymentAPI string) error {
 	resp, err := SendHTTPRequest(http.MethodGet, getDeploymentAPI)
+	if err != nil {
+		Fatalf("HTTP Response reading has failed: %v", err)
+		return err
+	}
 	defer resp.Body.Close()
-	contents, err := ioutil.ReadAll(resp.Body)
+	contents, err := io.ReadAll(resp.Body)
 	if err != nil {
 		Fatalf("HTTP Response reading has failed: %v", err)
 		return err
@@ -315,7 +327,8 @@ func GetDeployments(list *apps.DeploymentList, getDeploymentAPI string) error {
 func VerifyDeleteDeployment(getDeploymentAPI string) int {
 	resp, err := SendHTTPRequest(http.MethodGet, getDeploymentAPI)
 	if err != nil {
-		Fatalf("SendHTTPRequest is failed: %v", err)
+		Fatalf("Send HTTP Request failed: %v", err)
+		return -1
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode
@@ -357,6 +370,7 @@ func HandlePod(operation string, apiserver string, UID string, pod *v1.Pod) bool
 		Fatalf("HTTP request is failed :%v", err)
 		return false
 	}
+	defer resp.Body.Close()
 	Infof("%s %s %v in %v", req.Method, req.URL, resp.Status, time.Since(t))
 	return true
 }
@@ -402,6 +416,7 @@ func HandleDeployment(IsCloudCore, IsEdgeCore bool, operation, apiserver, UID, I
 		Fatalf("HTTP request is failed :%v", err)
 		return false
 	}
+	defer resp.Body.Close()
 	Infof("%s %s %v in %v", req.Method, req.URL, resp.Status, time.Since(t))
 	return true
 }
@@ -456,6 +471,7 @@ func ExposeCloudService(name, serviceHandler string) error {
 		Fatalf("HTTP request is failed :%v", err)
 		return err
 	}
+	defer resp.Body.Close()
 	Infof("%s %s %v in %v", req.Method, req.URL, resp.Status, time.Since(t))
 	gomega.Expect(resp.StatusCode).Should(gomega.Equal(http.StatusCreated))
 	return nil
@@ -473,7 +489,7 @@ func CreateServiceObject(name string) *v1.Service {
 
 	Service := v1.Service{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
-		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"app": constants.KubeEdge}},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"app": constants.SystemName}},
 
 		Spec: v1.ServiceSpec{
 			Ports:    portInfo,
@@ -494,8 +510,9 @@ func GetServicePort(cloudName, serviceHandler string) (int32, int32) {
 		Fatalf("HTTP request is failed :%v", err)
 		return -1, -1
 	}
+	defer resp.Body.Close()
 
-	contents, err := ioutil.ReadAll(resp.Body)
+	contents, err := io.ReadAll(resp.Body)
 	if err != nil {
 		Fatalf("HTTP Response reading has failed: %v", err)
 		return -1, -1
@@ -506,7 +523,6 @@ func GetServicePort(cloudName, serviceHandler string) (int32, int32) {
 		Fatalf("Unmarshal HTTP Response has failed: %v", err)
 		return -1, -1
 	}
-	defer resp.Body.Close()
 
 	for _, svcs := range svc.Items {
 		if svcs.Name == cloudName {
@@ -584,6 +600,7 @@ func HandleDeviceModel(operation string, apiserver string, UID string, protocolT
 		Fatalf("HTTP request is failed :%v", err)
 		return false, 0
 	}
+	defer resp.Body.Close()
 	Infof("%s %s %v in %v", req.Method, req.URL, resp.Status, time.Since(t))
 	return true, resp.StatusCode
 }
@@ -633,6 +650,7 @@ func HandleDeviceInstance(operation string, apiserver string, nodeSelector strin
 		Fatalf("HTTP request is failed :%v", err)
 		return false, 0
 	}
+	defer resp.Body.Close()
 	Infof("%s %s %v in %v", req.Method, req.URL, resp.Status, time.Since(t))
 	return true, resp.StatusCode
 }
@@ -702,8 +720,12 @@ func newDeviceModelObject(protocolType string, updated bool) *v1alpha2.DeviceMod
 // GetDeviceModel to get the deviceModel list and verify whether the contents of the device model matches with what is expected
 func GetDeviceModel(list *v1alpha2.DeviceModelList, getDeviceModelAPI string, expectedDeviceModel *v1alpha2.DeviceModel) ([]v1alpha2.DeviceModel, error) {
 	resp, err := SendHTTPRequest(http.MethodGet, getDeviceModelAPI)
+	if err != nil {
+		Fatalf("Send HTTP Request failed: %v", err)
+		return nil, err
+	}
 	defer resp.Body.Close()
-	contents, err := ioutil.ReadAll(resp.Body)
+	contents, err := io.ReadAll(resp.Body)
 	if err != nil {
 		Fatalf("HTTP Response reading has failed: %v", err)
 		return nil, err
@@ -721,12 +743,12 @@ func GetDeviceModel(list *v1alpha2.DeviceModelList, getDeviceModelAPI string, ex
 				if !reflect.DeepEqual(expectedDeviceModel.TypeMeta, deviceModel.TypeMeta) ||
 					expectedDeviceModel.ObjectMeta.Namespace != deviceModel.ObjectMeta.Namespace ||
 					!reflect.DeepEqual(expectedDeviceModel.Spec, deviceModel.Spec) {
-					return nil, errors.New("The device model is not matching with what was expected")
+					return nil, fmt.Errorf("The device model is not matching with what was expected")
 				}
 			}
 		}
 		if !modelExists {
-			return nil, errors.New("The requested device model is not found")
+			return nil, fmt.Errorf("The requested device model is not found")
 		}
 	}
 	return list.Items, nil
@@ -735,8 +757,12 @@ func GetDeviceModel(list *v1alpha2.DeviceModelList, getDeviceModelAPI string, ex
 // GetDevice to get the device list
 func GetDevice(list *v1alpha2.DeviceList, getDeviceAPI string, expectedDevice *v1alpha2.Device) ([]v1alpha2.Device, error) {
 	resp, err := SendHTTPRequest(http.MethodGet, getDeviceAPI)
+	if err != nil {
+		Fatalf("Send HTTP Request failed: %v", err)
+		return nil, err
+	}
 	defer resp.Body.Close()
-	contents, err := ioutil.ReadAll(resp.Body)
+	contents, err := io.ReadAll(resp.Body)
 	if err != nil {
 		Fatalf("HTTP Response reading has failed: %v", err)
 		return nil, err
@@ -755,7 +781,7 @@ func GetDevice(list *v1alpha2.DeviceList, getDeviceAPI string, expectedDevice *v
 					expectedDevice.ObjectMeta.Namespace != device.ObjectMeta.Namespace ||
 					!reflect.DeepEqual(expectedDevice.ObjectMeta.Labels, device.ObjectMeta.Labels) ||
 					!reflect.DeepEqual(expectedDevice.Spec, device.Spec) {
-					return nil, errors.New("The device is not matching with what was expected")
+					return nil, fmt.Errorf("The device is not matching with what was expected")
 				}
 				twinExists := false
 				for _, expectedTwin := range expectedDevice.Status.Twins {
@@ -763,18 +789,18 @@ func GetDevice(list *v1alpha2.DeviceList, getDeviceAPI string, expectedDevice *v
 						if expectedTwin.PropertyName == twin.PropertyName {
 							twinExists = true
 							if !reflect.DeepEqual(expectedTwin.Desired, twin.Desired) {
-								return nil, errors.New("Status twin " + twin.PropertyName + " not as expected")
+								return nil, fmt.Errorf("Status twin " + twin.PropertyName + " not as expected")
 							}
 						}
 					}
 				}
 				if !twinExists {
-					return nil, errors.New("status twin(s) not found")
+					return nil, fmt.Errorf("status twin(s) not found")
 				}
 			}
 		}
 		if !deviceExists {
-			return nil, errors.New("The requested device is not found")
+			return nil, fmt.Errorf("The requested device is not found")
 		}
 	}
 	return list.Items, nil
@@ -800,7 +826,7 @@ func MqttConnect() error {
 	ClientOpts = MqttClientInit("tcp://127.0.0.1:1884", "eventbus", "", "")
 	Client = MQTT.NewClient(ClientOpts)
 	if TokenClient = Client.Connect(); TokenClient.Wait() && TokenClient.Error() != nil {
-		return errors.New("client.Connect() Error is %s" + TokenClient.Error().Error())
+		return fmt.Errorf("client.Connect() Error is %s" + TokenClient.Error().Error())
 	}
 	return nil
 }
@@ -809,12 +835,12 @@ func MqttConnect() error {
 func ChangeTwinValue(updateMessage DeviceTwinUpdate, deviceID string) error {
 	twinUpdateBody, err := json.Marshal(updateMessage)
 	if err != nil {
-		return errors.New("Error in marshalling: %s" + err.Error())
+		return fmt.Errorf("Error in marshalling: %s" + err.Error())
 	}
 	deviceTwinUpdate := DeviceETPrefix + deviceID + TwinETUpdateSuffix
 	TokenClient = Client.Publish(deviceTwinUpdate, 0, false, twinUpdateBody)
 	if TokenClient.Wait() && TokenClient.Error() != nil {
-		return errors.New("client.publish() Error in device twin update is %s" + TokenClient.Error().Error())
+		return fmt.Errorf("client.publish() Error in device twin update is %s" + TokenClient.Error().Error())
 	}
 	return nil
 }
@@ -824,11 +850,11 @@ func GetTwin(updateMessage DeviceTwinUpdate, deviceID string) error {
 	getTwin := DeviceETPrefix + deviceID + TwinETGetSuffix
 	twinUpdateBody, err := json.Marshal(updateMessage)
 	if err != nil {
-		return errors.New("Error in marshalling: %s" + err.Error())
+		return fmt.Errorf("Error in marshalling: %s" + err.Error())
 	}
 	TokenClient = Client.Publish(getTwin, 0, false, twinUpdateBody)
 	if TokenClient.Wait() && TokenClient.Error() != nil {
-		return errors.New("client.publish() Error in device twin get  is: %s " + TokenClient.Error().Error())
+		return fmt.Errorf("client.publish() Error in device twin get  is: %s " + TokenClient.Error().Error())
 	}
 	return nil
 }
@@ -895,7 +921,7 @@ func CompareTwin(deviceTwin map[string]*MsgTwin, expectedDeviceTwin map[string]*
 	return true
 }
 
-func SendMsg(url string, message []byte) (bool, int) {
+func SendMsg(url string, message []byte, header map[string]string) (bool, int) {
 	var req *http.Request
 	var err error
 
@@ -911,6 +937,9 @@ func SendMsg(url string, message []byte) (bool, int) {
 		Fatalf("Frame HTTP request failed, request: %s, reason: %v", req.URL.String(), err)
 		return false, 0
 	}
+	for k, v := range header {
+		req.Header.Add(k, v)
+	}
 	t := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -918,6 +947,7 @@ func SendMsg(url string, message []byte) (bool, int) {
 		Fatalf("HTTP request is failed: %v", err)
 		return false, 0
 	}
+	defer resp.Body.Close()
 	Infof("%s %s %v in %v", req.Method, req.URL, resp.Status, time.Since(t))
 	return true, resp.StatusCode
 }
@@ -925,15 +955,28 @@ func SendMsg(url string, message []byte) (bool, int) {
 func StartEchoServer() (string, error) {
 	r := make(chan string)
 	echo := func(response http.ResponseWriter, request *http.Request) {
-		b, _ := ioutil.ReadAll(request.Body)
+		b, _ := io.ReadAll(request.Body)
 		r <- string(b)
 		if _, err := response.Write([]byte("Hello World")); err != nil {
 			Errorf("Echo server write failed. reason: %s", err.Error())
 		}
 	}
+	url := func(response http.ResponseWriter, request *http.Request) {
+		b, _ := io.ReadAll(request.Body)
+		var buff bytes.Buffer
+		buff.WriteString("Reply from server: ")
+		buff.Write(b)
+		buff.WriteString(" Header of the message: [user]: " + request.Header.Get("user") +
+			", [passwd]: " + request.Header.Get("passwd"))
+		if _, err := response.Write(buff.Bytes()); err != nil {
+			Errorf("Echo server write failed. reason: %s", err.Error())
+		}
+		r <- buff.String()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/echo", echo)
-	server := &http.Server{Addr: "0.0.0.0:9000", Handler: mux}
+	mux.HandleFunc("/url", url)
+	server := &http.Server{Addr: "127.0.0.1:9000", Handler: mux}
 	go func() {
 		err := server.ListenAndServe()
 		Errorf("Echo server stop. reason: %s", err.Error())
@@ -966,7 +1009,7 @@ func SubscribeMqtt(topic string) (string, error) {
 		return result, nil
 	case <-t.C:
 		close(r)
-		return "", errors.New("Wait for MQTT message time out. ")
+		return "", fmt.Errorf("Wait for MQTT message time out. ")
 	}
 }
 
@@ -977,4 +1020,88 @@ func PublishMqtt(topic, message string) error {
 	}
 	Infof("publish topic %s message %s", topic, message)
 	return nil
+}
+
+func CallServicebus() (response string, err error) {
+	var servicebusResponse ServicebusResponse
+	payload := strings.NewReader(`{"method":"POST","targetURL":"http://127.0.0.1:9000/echo","payload":""}`)
+	client := &http.Client{}
+	req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:9060", payload)
+	req.Header.Add("Content-Type", "application/json")
+	resp, _ := client.Do(req)
+	body, _ := io.ReadAll(resp.Body)
+	err = json.Unmarshal(body, &servicebusResponse)
+	response = servicebusResponse.Body
+	return
+}
+
+func GetStatefulSet(c clientset.Interface, ns, name string) (*apps.StatefulSet, error) {
+	return c.AppsV1().StatefulSets(ns).Get(context.TODO(), name, metav1.GetOptions{})
+}
+
+func CreateStatefulSet(c clientset.Interface, statefulSet *apps.StatefulSet) (*apps.StatefulSet, error) {
+	return c.AppsV1().StatefulSets(statefulSet.Namespace).Create(context.TODO(), statefulSet, metav1.CreateOptions{})
+}
+
+// DeleteStatefulSet to delete statefulSet
+func DeleteStatefulSet(c clientset.Interface, ns, name string) error {
+	err := c.AppsV1().StatefulSets(ns).Delete(context.TODO(), name, metav1.DeleteOptions{})
+	if err != nil && apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	return err
+}
+
+// NewTestStatefulSet create statefulSet for test
+func NewTestStatefulSet(name, imgURL string, replicas int32) *apps.StatefulSet {
+	return &apps.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: Namespace,
+			Labels:    map[string]string{"app": name},
+		},
+		Spec: apps.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": name},
+			},
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": name},
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name:  "nginx",
+							Image: imgURL,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// WaitForStatusReplicas waits for the ss.Status.Replicas to be equal to expectedReplicas
+func WaitForStatusReplicas(c clientset.Interface, ss *apps.StatefulSet, expectedReplicas int32) {
+	ns, name := ss.Namespace, ss.Name
+	pollErr := wait.PollImmediate(5*time.Second, 240*time.Second,
+		func() (bool, error) {
+			ssGet, err := c.AppsV1().StatefulSets(ns).Get(context.TODO(), name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			if ssGet.Status.ObservedGeneration < ss.Generation {
+				return false, nil
+			}
+			if ssGet.Status.Replicas != expectedReplicas {
+				klog.Infof("Waiting for stateful set status.replicas to become %d, currently %d", expectedReplicas, ssGet.Status.Replicas)
+				return false, nil
+			}
+			return true, nil
+		})
+	if pollErr != nil {
+		Fatalf("Failed waiting for stateful set status.replicas updated to %d: %v", expectedReplicas, pollErr)
+	}
 }

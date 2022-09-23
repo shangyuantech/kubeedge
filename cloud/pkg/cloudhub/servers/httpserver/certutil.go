@@ -16,6 +16,7 @@ import (
 	certutil "k8s.io/client-go/util/cert"
 
 	hubconfig "github.com/kubeedge/kubeedge/cloud/pkg/cloudhub/config"
+	"github.com/kubeedge/kubeedge/common/constants"
 )
 
 const validalityPeriod time.Duration = 365 * 100
@@ -43,7 +44,7 @@ func NewSelfSignedCACertDERBytes(key crypto.Signer) ([]byte, error) {
 	tmpl := x509.Certificate{
 		SerialNumber: big.NewInt(1024),
 		Subject: pkix.Name{
-			CommonName: "KubeEdge",
+			CommonName: constants.ProjectName,
 		},
 		NotBefore: time.Now().UTC(),
 		NotAfter:  time.Now().Add(time.Hour * 24 * 365 * 100),
@@ -58,7 +59,7 @@ func NewSelfSignedCACertDERBytes(key crypto.Signer) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return caDERBytes, err
+	return caDERBytes, nil
 }
 
 // NewCloudCoreCertDERandKey creates certificate and key for CloudCore
@@ -90,7 +91,7 @@ func NewCloudCoreCertDERandKey(cfg *certutil.Config) ([]byte, []byte, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to generate a certificate using the given CA certificate and key, err: %v", err)
 	}
-	return certDER, keyDER, err
+	return certDER, keyDER, nil
 }
 
 // NewCertFromCa creates a signed certificate using the given CA certificate and key
@@ -123,5 +124,5 @@ func NewCertFromCa(cfg *certutil.Config, caCert *x509.Certificate, serverKey cry
 	if err != nil {
 		return nil, err
 	}
-	return certDERBytes, err
+	return certDERBytes, nil
 }

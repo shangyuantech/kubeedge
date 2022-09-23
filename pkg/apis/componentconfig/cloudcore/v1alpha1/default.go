@@ -18,14 +18,11 @@ package v1alpha1
 
 import (
 	"path"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
-	componentbaseconfig "k8s.io/component-base/config"
 
 	"github.com/kubeedge/kubeedge/common/constants"
-	metaconfig "github.com/kubeedge/kubeedge/pkg/apis/componentconfig/meta/v1alpha1"
 )
 
 // NewDefaultCloudCoreConfig returns a full CloudCoreConfig object
@@ -37,12 +34,13 @@ func NewDefaultCloudCoreConfig() *CloudCoreConfig {
 			Kind:       Kind,
 			APIVersion: path.Join(GroupName, APIVersion),
 		},
+		CommonConfig: &CommonConfig{
+			TunnelPort: constants.ServerPort,
+		},
 		KubeAPIConfig: &KubeAPIConfig{
-			Master:      "",
 			ContentType: constants.DefaultKubeContentType,
 			QPS:         constants.DefaultKubeQPS,
 			Burst:       constants.DefaultKubeBurst,
-			KubeConfig:  constants.DefaultKubeConfig,
 		},
 		Modules: &Modules{
 			CloudHub: &CloudHub{
@@ -57,6 +55,7 @@ func NewDefaultCloudCoreConfig() *CloudCoreConfig {
 				AdvertiseAddress:        []string{advertiseAddress.String()},
 				DNSNames:                []string{""},
 				EdgeCertSigningDuration: 365,
+				TokenRefreshDuration:    12,
 				Quic: &CloudHubQUIC{
 					Enable:             false,
 					Address:            "0.0.0.0",
@@ -98,15 +97,15 @@ func NewDefaultCloudCoreConfig() *CloudCoreConfig {
 					QueryPersistentVolume:      constants.DefaultQueryPersistentVolumeBuffer,
 					QueryPersistentVolumeClaim: constants.DefaultQueryPersistentVolumeClaimBuffer,
 					QueryVolumeAttachment:      constants.DefaultQueryVolumeAttachmentBuffer,
+					CreateNode:                 constants.DefaultCreateNodeBuffer,
+					PatchNode:                  constants.DefaultPatchNodeBuffer,
 					QueryNode:                  constants.DefaultQueryNodeBuffer,
 					UpdateNode:                 constants.DefaultUpdateNodeBuffer,
+					PatchPod:                   constants.DefaultPatchPodBuffer,
 					DeletePod:                  constants.DefaultDeletePodBuffer,
-				},
-				Context: &ControllerContext{
-					SendModule:       metaconfig.ModuleNameCloudHub,
-					SendRouterModule: metaconfig.ModuleNameRouter,
-					ReceiveModule:    metaconfig.ModuleNameEdgeController,
-					ResponseModule:   metaconfig.ModuleNameCloudHub,
+					CreateLease:                constants.DefaultCreateLeaseBuffer,
+					QueryLease:                 constants.DefaultQueryLeaseBuffer,
+					ServiceAccountToken:        constants.DefaultServiceAccountTokenBuffer,
 				},
 				Load: &EdgeControllerLoad{
 					UpdatePodStatusWorkers:            constants.DefaultUpdatePodStatusWorkers,
@@ -119,17 +118,19 @@ func NewDefaultCloudCoreConfig() *CloudCoreConfig {
 					QueryPersistentVolumeClaimWorkers: constants.DefaultQueryPersistentVolumeClaimWorkers,
 					QueryVolumeAttachmentWorkers:      constants.DefaultQueryVolumeAttachmentWorkers,
 					QueryNodeWorkers:                  constants.DefaultQueryNodeWorkers,
+					CreateNodeWorkers:                 constants.DefaultCreateNodeWorkers,
+					PatchNodeWorkers:                  constants.DefaultPatchNodeWorkers,
 					UpdateNodeWorkers:                 constants.DefaultUpdateNodeWorkers,
+					PatchPodWorkers:                   constants.DefaultPatchPodWorkers,
 					DeletePodWorkers:                  constants.DefaultDeletePodWorkers,
+					CreateLeaseWorkers:                constants.DefaultCreateLeaseWorkers,
+					QueryLeaseWorkers:                 constants.DefaultQueryLeaseWorkers,
+					UpdateRuleStatusWorkers:           constants.DefaultUpdateRuleStatusWorkers,
+					ServiceAccountTokenWorkers:        constants.DefaultServiceAccountTokenWorkers,
 				},
 			},
 			DeviceController: &DeviceController{
 				Enable: true,
-				Context: &ControllerContext{
-					SendModule:     metaconfig.ModuleNameCloudHub,
-					ReceiveModule:  metaconfig.ModuleNameDeviceController,
-					ResponseModule: metaconfig.ModuleNameCloudHub,
-				},
 				Buffer: &DeviceControllerBuffer{
 					UpdateDeviceStatus: constants.DefaultUpdateDeviceStatusBuffer,
 					DeviceEvent:        constants.DefaultDeviceEventBuffer,
@@ -137,6 +138,16 @@ func NewDefaultCloudCoreConfig() *CloudCoreConfig {
 				},
 				Load: &DeviceControllerLoad{
 					UpdateDeviceStatusWorkers: constants.DefaultUpdateDeviceStatusWorkers,
+				},
+			},
+			NodeUpgradeJobController: &NodeUpgradeJobController{
+				Enable: false,
+				Buffer: &NodeUpgradeJobControllerBuffer{
+					UpdateNodeUpgradeJobStatus: constants.DefaultNodeUpgradeJobStatusBuffer,
+					NodeUpgradeJobEvent:        constants.DefaultNodeUpgradeJobEventBuffer,
+				},
+				Load: &NodeUpgradeJobControllerLoad{
+					NodeUpgradeJobWorkers: constants.DefaultNodeUpgradeJobWorkers,
 				},
 			},
 			SyncController: &SyncController{
@@ -162,15 +173,10 @@ func NewDefaultCloudCoreConfig() *CloudCoreConfig {
 				Port:        9443,
 				RestTimeout: 60,
 			},
-		},
-		LeaderElection: &componentbaseconfig.LeaderElectionConfiguration{
-			LeaderElect:       false,
-			LeaseDuration:     metav1.Duration{Duration: 15 * time.Second},
-			RenewDeadline:     metav1.Duration{Duration: 10 * time.Second},
-			RetryPeriod:       metav1.Duration{Duration: 2 * time.Second},
-			ResourceLock:      "endpointsleases",
-			ResourceNamespace: constants.KubeEdgeNameSpace,
-			ResourceName:      "cloudcorelease",
+			IptablesManager: &IptablesManager{
+				Enable: true,
+				Mode:   InternalMode,
+			},
 		},
 	}
 	return c
@@ -184,10 +190,6 @@ func NewMinCloudCoreConfig() *CloudCoreConfig {
 		TypeMeta: metav1.TypeMeta{
 			Kind:       Kind,
 			APIVersion: path.Join(GroupName, APIVersion),
-		},
-		KubeAPIConfig: &KubeAPIConfig{
-			Master:     "",
-			KubeConfig: constants.DefaultKubeConfig,
 		},
 		Modules: &Modules{
 			CloudHub: &CloudHub{
@@ -218,9 +220,10 @@ func NewMinCloudCoreConfig() *CloudCoreConfig {
 				Port:        9443,
 				RestTimeout: 60,
 			},
-		},
-		LeaderElection: &componentbaseconfig.LeaderElectionConfiguration{
-			LeaderElect: false,
+			IptablesManager: &IptablesManager{
+				Enable: true,
+				Mode:   InternalMode,
+			},
 		},
 	}
 }

@@ -25,7 +25,6 @@ package edged
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -154,13 +153,13 @@ func (e *edged) getPodVolumePathListFromDisk(podUID types.UID) ([]string, error)
 	podVolDir := e.getPodVolumesDir(podUID)
 
 	if pathExists, pathErr := mount.PathExists(podVolDir); pathErr != nil {
-		return volumes, fmt.Errorf("Error checking if path %q exists: %v", podVolDir, pathErr)
+		return volumes, fmt.Errorf("error checking if path %q exists: %v", podVolDir, pathErr)
 	} else if !pathExists {
 		klog.Warningf("Path %q does not exist", podVolDir)
 		return volumes, nil
 	}
 
-	volumePluginDirs, err := ioutil.ReadDir(podVolDir)
+	volumePluginDirs, err := os.ReadDir(podVolDir)
 	if err != nil {
 		klog.Errorf("Could not read directory %s: %v", podVolDir, err)
 		return volumes, err
@@ -170,7 +169,7 @@ func (e *edged) getPodVolumePathListFromDisk(podUID types.UID) ([]string, error)
 		volumePluginPath := filepath.Join(podVolDir, volumePluginName)
 		volumeDirs, err := utilfile.ReadDirNoStat(volumePluginPath)
 		if err != nil {
-			return volumes, fmt.Errorf("Could not read directory %s: %v", volumePluginPath, err)
+			return volumes, fmt.Errorf("could not read directory %s: %v", volumePluginPath, err)
 		}
 		for _, volumeDir := range volumeDirs {
 			volumes = append(volumes, filepath.Join(volumePluginPath, volumeDir))
@@ -202,7 +201,7 @@ func (e *edged) podVolumeSubpathsDirExists(podUID types.UID) (bool, error) {
 	podVolDir := e.getPodVolumeSubpathsDir(podUID)
 
 	if pathExists, pathErr := mount.PathExists(podVolDir); pathErr != nil {
-		return true, fmt.Errorf("Error checking if path %q exists: %v", podVolDir, pathErr)
+		return true, fmt.Errorf("error checking if path %q exists: %v", podVolDir, pathErr)
 	} else if !pathExists {
 		return false, nil
 	}
@@ -246,6 +245,23 @@ func (e *edged) ListVolumesForPod(podUID types.UID) (map[string]volume.Volume, b
 			continue
 		}
 		volumesToReturn[outerVolumeSpecName] = volume.Mounter
+	}
+
+	return volumesToReturn, len(volumesToReturn) > 0
+}
+
+func (e *edged) ListBlockVolumesForPod(podUID types.UID) (map[string]volume.BlockVolume, bool) {
+	volumesToReturn := make(map[string]volume.BlockVolume)
+	podVolumes := e.volumeManager.GetMountedVolumesForPod(
+		volumetypes.UniquePodName(podUID))
+	for outerVolumeSpecName, volume := range podVolumes {
+		// TODO: volume.Mounter could be nil if volume object is recovered
+		// from reconciler's sync state process. PR 33616 will fix this problem
+		// to create Mounter object when recovering volume state.
+		if volume.BlockVolumeMapper == nil {
+			continue
+		}
+		volumesToReturn[outerVolumeSpecName] = volume.BlockVolumeMapper
 	}
 
 	return volumesToReturn, len(volumesToReturn) > 0

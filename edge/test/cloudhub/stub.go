@@ -3,10 +3,8 @@ package test
 import (
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"net/http"
 
-	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
@@ -30,6 +28,8 @@ type stubCloudHub struct {
 	wsConn *websocket.Conn
 	enable bool
 }
+
+var _ core.Module = (*stubCloudHub)(nil)
 
 func (*stubCloudHub) Name() string {
 	return "stubCloudHub"
@@ -76,7 +76,7 @@ func (tm *stubCloudHub) serveEvent(w http.ResponseWriter, r *http.Request) {
 
 func (tm *stubCloudHub) podHandler(w http.ResponseWriter, req *http.Request) {
 	if req.Body != nil {
-		body, err := ioutil.ReadAll(req.Body)
+		body, err := io.ReadAll(req.Body)
 		if err != nil {
 			klog.Errorf("read body error %v", err)
 			w.Write([]byte("read request body error"))
@@ -112,13 +112,12 @@ func (tm *stubCloudHub) podHandler(w http.ResponseWriter, req *http.Request) {
 func (tm *stubCloudHub) Start() {
 	defer tm.Cleanup()
 
-	router := mux.NewRouter()
-	router.HandleFunc("/{group_id}/events", tm.serveEvent) // for edge-hub
-	router.HandleFunc("/pod", tm.podHandler)               // for pod test
-
+	mux := http.NewServeMux()
+	mux.HandleFunc("/{group_id}/events", tm.serveEvent) // for edge-hub
+	mux.HandleFunc("/pod", tm.podHandler)               // for pod test
 	s := http.Server{
 		Addr:    "127.0.0.1:20000",
-		Handler: router,
+		Handler: mux,
 	}
 	klog.Info("Start cloud hub service")
 	err := s.ListenAndServe()

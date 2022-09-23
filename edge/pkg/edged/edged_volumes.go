@@ -51,7 +51,7 @@ func (e *edged) newVolumeMounterFromPlugins(spec *volume.Spec, pod *api.Pod, opt
 	if err != nil {
 		return nil, fmt.Errorf("failed to instantiate mounter for volume: %s using plugin: %s with a root cause: %v", spec.Name(), plugin.GetPluginName(), err)
 	}
-	klog.Infof("Using volume plugin %q to mount %s", plugin.GetPluginName(), spec.Name())
+	klog.V(5).Infof("Using volume plugin %q to mount %s", plugin.GetPluginName(), spec.Name())
 	return physicalMounter, nil
 }
 
@@ -87,11 +87,11 @@ func (e *edged) cleanupOrphanedPodDirs(pods []*api.Pod, containerRunningPods []*
 		// If there are still volume directories, do not delete directory
 		volumePaths, err := e.getPodVolumePathListFromDisk(uid)
 		if err != nil {
-			orphanVolumeErrors = append(orphanVolumeErrors, fmt.Errorf("Orphaned pod %q found, but error %v occurred during reading volume dir from disk", uid, err))
+			orphanVolumeErrors = append(orphanVolumeErrors, fmt.Errorf("orphaned pod %q found, but error %v occurred during reading volume dir from disk", uid, err))
 			continue
 		}
 		if len(volumePaths) > 0 {
-			orphanVolumeErrors = append(orphanVolumeErrors, fmt.Errorf("Orphaned pod %q found, but volume paths are still present on disk", uid))
+			orphanVolumeErrors = append(orphanVolumeErrors, fmt.Errorf("orphaned pod %q found, but volume paths are still present on disk", uid))
 			continue
 		}
 
@@ -105,11 +105,11 @@ func (e *edged) cleanupOrphanedPodDirs(pods []*api.Pod, containerRunningPods []*
 		// If there are any volume-subpaths, do not cleanup directories
 		volumeSubpathExists, err := e.podVolumeSubpathsDirExists(uid)
 		if err != nil {
-			orphanVolumeErrors = append(orphanVolumeErrors, fmt.Errorf("Orphaned pod %q found, but error %v occurred during reading of volume-subpaths dir from disk", uid, err))
+			orphanVolumeErrors = append(orphanVolumeErrors, fmt.Errorf("orphaned pod %q found, but error %v occurred during reading of volume-subpaths dir from disk", uid, err))
 			continue
 		}
 		if volumeSubpathExists {
-			orphanVolumeErrors = append(orphanVolumeErrors, fmt.Errorf("Orphaned pod %q found, but volume subpaths are still present on disk", uid))
+			orphanVolumeErrors = append(orphanVolumeErrors, fmt.Errorf("orphaned pod %q found, but volume subpaths are still present on disk", uid))
 			continue
 		}
 

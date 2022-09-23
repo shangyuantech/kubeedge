@@ -70,7 +70,7 @@ func (s *TunnelSession) serveContainerExecConnection(m *stream.Message) error {
 	}
 
 	s.AddLocalConnection(m.ConnectID, execCon)
-	klog.V(6).Infof("Get Exec Connection info: %++v", *execCon)
+	klog.V(6).Infof("Get Exec Connection info: %+v", *execCon)
 	return execCon.Serve(s.Tunnel)
 }
 
@@ -163,6 +163,10 @@ func (s *TunnelSession) Serve() error {
 		if err != nil {
 			klog.Errorf("Get tunnel Message error %v", err)
 			return err
+		}
+
+		if mess.MessageType == stream.MessageTypeCloseConnect {
+			return fmt.Errorf("close tunnel stream connection, error:%s", string(mess.Data))
 		}
 
 		if mess.MessageType < stream.MessageTypeData {

@@ -17,6 +17,7 @@
 KUBEEDGE_ROOT=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )/..
 ENABLE_DAEMON=${ENABLE_DAEMON:-false}
 LOG_DIR=${LOG_DIR:-"/tmp"}
+LOG_LEVEL=${LOG_LEVEL:-2}
 TIMEOUT=${TIMEOUT:-60}s
 
 if [[ "${CLUSTER_NAME}x" == "x" ]];then
@@ -26,9 +27,9 @@ fi
 export CLUSTER_CONTEXT="--name ${CLUSTER_NAME}"
 
 function check_prerequisites {
+  kubeedge::golang::verify_golang_version
   check_kubectl
   check_kind
-  verify_go_version
   verify_docker_installed
 }
 
@@ -47,9 +48,6 @@ function uninstall_kubeedge {
 
   # delete data
   rm -rf /tmp/etc/kubeedge /tmp/var/lib/kubeedge
-
-  # delete iptables rule
-  sudo iptables -t nat -D PREROUTING -p tcp --dport 10350 -j REDIRECT --to-port 10003 || true
 }
 
 # clean up
@@ -86,6 +84,11 @@ function create_rule_crd {
   kubectl apply -f ${KUBEEDGE_ROOT}/build/crds/router/router_v1_ruleEndpoint.yaml
 }
 
+function create_operation_crd {
+  echo "creating the operation crd..."
+  kubectl apply -f ${KUBEEDGE_ROOT}/build/crds/operations/operations_v1alpha1_nodeupgradejob.yaml
+}
+
 function build_cloudcore {
   echo "building the cloudcore..."
   make -C "${KUBEEDGE_ROOT}" WHAT="cloudcore"
@@ -100,17 +103,15 @@ function start_cloudcore {
   CLOUD_CONFIGFILE=${KUBEEDGE_ROOT}/_output/local/bin/cloudcore.yaml
   CLOUD_BIN=${KUBEEDGE_ROOT}/_output/local/bin/cloudcore
   ${CLOUD_BIN} --defaultconfig >  ${CLOUD_CONFIGFILE}
-  sed -i '/modules:/a\  cloudStream:\n    enable: true\n    streamPort: 10003\n    tlsStreamCAFile: /etc/kubeedge/ca/streamCA.crt\n    tlsStreamCertFile: /etc/kubeedge/certs/stream.crt\n    tlsStreamPrivateKeyFile: /etc/kubeedge/certs/stream.key\n    tlsTunnelCAFile: /etc/kubeedge/ca/rootCA.crt\n    tlsTunnelCertFile: /etc/kubeedge/certs/server.crt\n    tlsTunnelPrivateKeyFile: /etc/kubeedge/certs/server.key\n    tunnelPort: 10004' ${CLOUD_CONFIGFILE}
+  sed -i '/cloudStream:/{n;s/false/true/;}' ${CLOUD_CONFIGFILE}
   sed -i -e "s|kubeConfig: .*|kubeConfig: ${KUBECONFIG}|g" \
     -e "s|/var/lib/kubeedge/|/tmp&|g" \
     -e "s|/etc/|/tmp/etc/|g" \
-    -e '/router:/a\    enable: true' ${CLOUD_CONFIGFILE}
+    -e '/router:/{n;N;N;N;N;s/false/true/}' ${CLOUD_CONFIGFILE}
   CLOUDCORE_LOG=${LOG_DIR}/cloudcore.log
   echo "start cloudcore..."
-  nohup sudo ${CLOUD_BIN} --config=${CLOUD_CONFIGFILE} > "${CLOUDCORE_LOG}" 2>&1 &
+  nohup sudo ${CLOUD_BIN} --config=${CLOUD_CONFIGFILE} --v=${LOG_LEVEL} > "${CLOUDCORE_LOG}" 2>&1 &
   CLOUDCORE_PID=$!
-
-  sudo iptables -t nat -A PREROUTING -p tcp --dport 10350 -j REDIRECT --to-port 10003
 
   # ensure tokensecret is generated
   while true; do
@@ -124,20 +125,21 @@ function start_edgecore {
   EDGE_BIN=${KUBEEDGE_ROOT}/_output/local/bin/edgecore
   ${EDGE_BIN} --defaultconfig >  ${EDGE_CONFIGFILE}
 
-  sed -i '/modules:/a\  edgeStream:\n    enable: true\n    handshakeTimeout: 30\n    readDeadline: 15\n    server: 127.0.0.1:10004\n    tlsTunnelCAFile: /etc/kubeedge/ca/rootCA.crt\n    tlsTunnelCertFile: /etc/kubeedge/certs/server.crt\n    tlsTunnelPrivateKeyFile: /etc/kubeedge/certs/server.key\n    writeDeadline: 15' ${EDGE_CONFIGFILE}
+  sed -i '/edgeStream:/{n;s/false/true/;}' ${EDGE_CONFIGFILE}
   token=`kubectl get secret -nkubeedge tokensecret -o=jsonpath='{.data.tokendata}' | base64 -d`
 
   sed -i -e "s|token: .*|token: ${token}|g" \
       -e "s|hostnameOverride: .*|hostnameOverride: edge-node|g" \
       -e "s|/etc/|/tmp/etc/|g" \
       -e "s|/var/lib/kubeedge/|/tmp&|g" \
-      -e "s|mqttMode: .*|mqttMode: 0|g" ${EDGE_CONFIGFILE}
+      -e "s|mqttMode: .*|mqttMode: 0|g" \
+      -e '/serviceBus:/{n;s/false/true/;}' ${EDGE_CONFIGFILE}
 
   EDGECORE_LOG=${LOG_DIR}/edgecore.log
 
   echo "start edgecore..."
   export CHECK_EDGECORE_ENVIRONMENT="false"
-  nohup sudo -E ${EDGE_BIN} --config=${EDGE_CONFIGFILE} > "${EDGECORE_LOG}" 2>&1 &
+  nohup sudo -E ${EDGE_BIN} --config=${EDGE_CONFIGFILE} --v=${LOG_LEVEL} > "${EDGECORE_LOG}" 2>&1 &
   EDGECORE_PID=$!
 }
 
@@ -195,6 +197,7 @@ function generate_streamserver_cert {
 
 cleanup
 
+source "${KUBEEDGE_ROOT}/hack/lib/golang.sh"
 source "${KUBEEDGE_ROOT}/hack/lib/install.sh"
 
 check_prerequisites
@@ -218,6 +221,7 @@ kubectl create ns kubeedge
 create_device_crd
 create_objectsync_crd
 create_rule_crd
+create_operation_crd
 
 generate_streamserver_cert
 

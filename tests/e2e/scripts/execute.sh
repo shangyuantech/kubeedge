@@ -22,15 +22,32 @@ cd $workdir
 curpath=$PWD
 echo $PWD
 
-which ginkgo &> /dev/null || (
-    go get github.com/onsi/ginkgo/ginkgo
-    sudo cp $GOPATH/bin/ginkgo /usr/local/bin/
-)
+check_ginkgo_v2() {
+    # check if ginkgo is installed
+    which ginkgo &> /dev/null || (
+        echo "ginkgo is not found, install first"
+        go install github.com/onsi/ginkgo/v2/ginkgo@v2.1.4
+        sudo cp $GOPATH/bin/ginkgo /usr/local/bin/
+        return
+    )
+    
+    # check if the ginkgo version is v2
+    local -a ginkgo_version_output
+    read -ra ginkgo_version_output <<< $(ginkgo version)
+    # Assuming ginkgo version output format is: 
+    # Ginkgo Version 2.1.4
+    if [[ "${ginkgo_version_output[2]}" != "2.1.4" ]]; then
+        echo "ginkgo version is not v2.1.4, reinstall ginkgo v2.1.4"
+        go install github.com/onsi/ginkgo/v2/ginkgo@v2.1.4
+        sudo cp $GOPATH/bin/ginkgo /usr/local/bin/
+    fi
+}
 
 cleanup() {
     bash ${curpath}/tests/e2e/scripts/cleanup.sh
 }
 
+check_ginkgo_v2
 cleanup
 
 E2E_DIR=${curpath}/tests/e2e
@@ -49,25 +66,8 @@ kubectl create clusterrolebinding system:anonymous --clusterrole=cluster-admin -
 
 :> /tmp/testcase.log
 
-bash -x ${E2E_DIR}/scripts/fast_test.sh $1
-
-#stop the edgecore after the test completion
-grep  -e "Running Suite" -e "SUCCESS\!" -e "FAIL\!" /tmp/testcase.log | sed -r 's/\x1B\[([0-9];)?([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g' | sed -r 's/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g'
-echo "Integration Test Final Summary Report"
-echo "==============================================="
-echo "Total Number of Test cases = `grep "Ran " /tmp/testcase.log | awk '{sum+=$2} END {print sum}'`"
-passed=`grep -e "SUCCESS\!" -e "FAIL\!" /tmp/testcase.log | awk '{print $3}' | sed -r "s/\x1B\[([0-9];)?([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g" | awk '{sum+=$1} END {print sum}'`
-echo "Number of Test cases PASSED = $passed"
-fail=`grep -e "SUCCESS\!" -e "FAIL\!" /tmp/testcase.log | awk '{print $6}' | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g" | awk '{sum+=$1} END {print sum}'`
-echo "Number of Test cases FAILED = $fail"
-echo "==================Result Summary======================="
+export GINKGO_TESTING_RESULT=0
 
 trap cleanup EXIT
 
-if [ "$fail" != "0" ];then
-    echo "Integration suite has failures, Please check !!"
-    exit 1
-else
-    echo "Integration suite successfully passed all the tests !!"
-    exit 0
-fi
+bash -x ${E2E_DIR}/scripts/fast_test.sh $1

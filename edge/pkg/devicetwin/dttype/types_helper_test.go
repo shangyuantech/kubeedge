@@ -26,6 +26,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kubeedge/kubeedge/edge/pkg/devicetwin/dtclient"
+	"github.com/kubeedge/kubeedge/edge/pkg/devicetwin/dtcommon"
 )
 
 // TestUnmarshalMembershipDetail is function to test UnmarshalMembershipDetails()
@@ -236,6 +237,7 @@ func createMessageTwinFromDeviceTwin(devTwin dtclient.DeviceTwin) map[string]*Ms
 	var actualMeta ValueMetadata
 	actualValue := &TwinValue{Value: &devTwin.Actual}
 	json.Unmarshal([]byte(devTwin.ActualMeta), &actualMeta)
+	actualValue.Metadata = &actualMeta
 	var expectedVersion TwinVersion
 	json.Unmarshal([]byte(devTwin.ExpectedVersion), &expectedVersion)
 	var actualVersion TwinVersion
@@ -645,7 +647,7 @@ func createMessageTwin() map[string]*MsgTwin {
 	msgTwins := make(map[string]*MsgTwin)
 	twinMetadataDeleted := MsgTwin{
 		Metadata: &TypeMetadata{
-			Type: "deleted"},
+			Type: dtcommon.TypeDeleted},
 	}
 	twinMetadataUpdated := MsgTwin{
 		Metadata: &TypeMetadata{
@@ -653,7 +655,7 @@ func createMessageTwin() map[string]*MsgTwin {
 		},
 	}
 	msgTwins["empty"] = nil
-	msgTwins["deleted"] = &twinMetadataDeleted
+	msgTwins[dtcommon.TypeDeleted] = &twinMetadataDeleted
 	msgTwins["updated"] = &twinMetadataUpdated
 	return msgTwins
 }
@@ -813,7 +815,7 @@ func createMessageTwinWithDiffValues(baseMessage BaseMessage) map[string]*MsgTwi
 	msgTwins := make(map[string]*MsgTwin)
 	twinMetadataDeleted := MsgTwin{
 		Metadata: &TypeMetadata{
-			Type: "deleted",
+			Type: dtcommon.TypeDeleted,
 		},
 	}
 	expected := "ON"
@@ -829,8 +831,8 @@ func createMessageTwinWithDiffValues(baseMessage BaseMessage) map[string]*MsgTwi
 			Value: &actual,
 		},
 	}
-	msgTwins["deleted"] = &twinMetadataDeleted
-	msgTwins["twin"] = &twinActualExpected
+	msgTwins[dtcommon.TypeDeleted] = &twinMetadataDeleted
+	msgTwins[dtcommon.DeviceTwinModule] = &twinActualExpected
 	twinExpected := MsgTwin{
 		Metadata: &TypeMetadata{
 			Type: "updated",
@@ -1001,7 +1003,7 @@ func TestBuildDeviceTwinDocument(t *testing.T) {
 		},
 		CurrentState: &MsgTwin{
 			Metadata: &TypeMetadata{
-				Type: "deleted",
+				Type: dtcommon.TypeDeleted,
 			},
 		},
 	}

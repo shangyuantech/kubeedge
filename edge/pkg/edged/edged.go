@@ -30,6 +30,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -77,10 +79,11 @@ import (
 	serverstats "k8s.io/kubernetes/pkg/kubelet/server/stats"
 	"k8s.io/kubernetes/pkg/kubelet/stats"
 	kubestatus "k8s.io/kubernetes/pkg/kubelet/status"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
 	"k8s.io/kubernetes/pkg/kubelet/util/queue"
 	"k8s.io/kubernetes/pkg/kubelet/volumemanager"
-	schedulercache "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	schedulercache "k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/configmap"
 	"k8s.io/kubernetes/pkg/volume/downwardapi"
@@ -90,28 +93,28 @@ import (
 	"k8s.io/kubernetes/pkg/volume/nfs"
 	"k8s.io/kubernetes/pkg/volume/projected"
 	secretvolume "k8s.io/kubernetes/pkg/volume/secret"
+	volumeutil "k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/kubernetes/pkg/volume/util/hostutil"
 	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
-	"k8s.io/utils/mount"
+	"k8s.io/mount-utils"
 
-	"github.com/kubeedge/beehive/pkg/common/util"
 	"github.com/kubeedge/beehive/pkg/core"
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/kubeedge/beehive/pkg/core/model"
 	"github.com/kubeedge/kubeedge/common/constants"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
+	"github.com/kubeedge/kubeedge/edge/pkg/common/util"
 	"github.com/kubeedge/kubeedge/edge/pkg/edged/apis"
 	edgecadvisor "github.com/kubeedge/kubeedge/edge/pkg/edged/cadvisor"
 	"github.com/kubeedge/kubeedge/edge/pkg/edged/clcm"
 	edgedconfig "github.com/kubeedge/kubeedge/edge/pkg/edged/config"
-	fakekube "github.com/kubeedge/kubeedge/edge/pkg/edged/fake"
+	clientbridge "github.com/kubeedge/kubeedge/edge/pkg/edged/kubeclientbridge"
 	"github.com/kubeedge/kubeedge/edge/pkg/edged/podmanager"
 	"github.com/kubeedge/kubeedge/edge/pkg/edged/server"
 	"github.com/kubeedge/kubeedge/edge/pkg/edged/status"
 	edgedutil "github.com/kubeedge/kubeedge/edge/pkg/edged/util"
 	"github.com/kubeedge/kubeedge/edge/pkg/edged/util/record"
 	csiplugin "github.com/kubeedge/kubeedge/edge/pkg/edged/volume/csi"
-	"github.com/kubeedge/kubeedge/edge/pkg/metamanager"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/client"
 	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha1"
 	"github.com/kubeedge/kubeedge/pkg/version"
@@ -146,19 +149,26 @@ const (
 	DockerShimEndpoint = "unix:///var/run/dockershim.sock"
 	//DockerShimEndpointDeprecated this is the deprecated dockershim endpoint
 	DockerShimEndpointDeprecated = "/var/run/dockershim.sock"
-	//DockershimRootDir givesthe default path to the dockershim root directory
+	//DockershimRootDir gives-the default path to the dockershim root directory
 	DockershimRootDir = "/var/lib/dockershim"
-	//HairpinMode only use forkubenetNetworkPlugin.Currently not working
+	//HairpinMode only use forkubenetNetworkPlugin.Currently, not working
 	HairpinMode = kubeletinternalconfig.HairpinVeth
-	//NonMasqueradeCIDR only use forkubenetNetworkPlugin.Currently not working
+	//NonMasqueradeCIDR only use forkubenetNetworkPlugin.Currently, not working
 	NonMasqueradeCIDR = "10.0.0.1/8"
 	//cgroupName used for check if the cgroup is mounted.(default "")
 	cgroupName = ""
 	// redirectContainerStream decide whether to redirect the container stream
 	redirectContainerStream = false
-	// ResolvConfDefault gives the default dns resolv configration file
+	// ResolvConfDefault gives the default dns resolve configuration file
 	ResolvConfDefault = "/etc/resolv.conf"
 )
+
+type GetRuntimeServiceFunc func(
+	remoteRuntimeEndpoint,
+	remoteImageEndpoint string,
+	runtimeRequestTimeout metav1.Duration) (internalapi.RuntimeService, internalapi.ImageManagerService, error)
+
+var DefaultGetRuntimeService GetRuntimeServiceFunc = getRuntimeAndImageServices
 
 // podReady holds the initPodReady flag and its lock
 type podReady struct {
@@ -176,6 +186,7 @@ type edged struct {
 	namespace                 string
 	nodeName                  string
 	runtimeCache              kubecontainer.RuntimeCache
+	customInterfaceName       string
 	uid                       types.UID
 	nodeStatusUpdateFrequency time.Duration
 	registrationCompleted     bool
@@ -197,6 +208,7 @@ type edged struct {
 	kubeClient         clientset.Interface
 	probeManager       prober.Manager
 	livenessManager    proberesults.Manager
+	readinessManager   proberesults.Manager
 	startupManager     proberesults.Manager
 	server             *server.Server
 	podAdditionQueue   *workqueue.Type
@@ -213,6 +225,7 @@ type edged struct {
 	rootDirectory      string
 	gpuPluginEnabled   bool
 	version            string
+	labels             map[string]string
 	// podReady is structure with initPodReady flag and its lock
 	podReady
 	// cache for secret
@@ -228,7 +241,7 @@ type edged struct {
 	nodeIP net.IP
 
 	// StatsProvider provides the node and the container stats.
-	*stats.StatsProvider
+	*stats.Provider
 
 	// cAdvisor used for container information.
 	cadvisor cadvisor.Interface
@@ -256,6 +269,8 @@ type edged struct {
 	podKiller PodKiller
 }
 
+var _ core.Module = (*edged)(nil)
+
 // Register register edged
 func Register(e *v1alpha1.Edged) {
 	edgedconfig.InitConfigure(e)
@@ -263,7 +278,6 @@ func Register(e *v1alpha1.Edged) {
 	if err != nil {
 		klog.Errorf("init new edged error, %v", err)
 		os.Exit(1)
-		return
 	}
 	core.Register(edged)
 }
@@ -301,7 +315,7 @@ func (e *edged) Start() {
 		true,
 		types.NodeName(e.nodeName),
 		e.podManager,
-		e.statusManager,
+		e,
 		e.kubeClient,
 		e.volumePluginMgr,
 		e.containerRuntime,
@@ -320,7 +334,14 @@ func (e *edged) Start() {
 	// handled by pod workers).
 	go utilwait.Until(e.podKiller.PerformPodKillingWork, 5*time.Second, utilwait.NeverStop)
 
-	e.probeManager = prober.NewManager(e.statusManager, e.livenessManager, e.startupManager, e.runner, record.NewEventRecorder())
+	// update node label
+	node, _ := e.GetNode()
+	node.Labels = e.labels
+	if err := e.metaClient.Nodes(e.namespace).Update(node); err != nil {
+		klog.Errorf("update node failed, error: %v", err)
+	}
+
+	e.probeManager = prober.NewManager(e.statusManager, e.livenessManager, e.readinessManager, e.startupManager, e.runner, record.NewEventRecorder())
 	e.pleg = pleg.NewGenericPLEG(e.containerRuntime, plegChannelCapacity, plegRelistPeriod, e.podCache, clock.RealClock{})
 	e.statusManager.Start()
 	e.pleg.Start()
@@ -330,7 +351,7 @@ func (e *edged) Start() {
 
 	housekeepingTicker := time.NewTicker(housekeepingPeriod)
 	syncWorkQueueCh := time.NewTicker(syncWorkQueuePeriod)
-	e.probeManager.Start()
+
 	go e.syncLoopIteration(e.pleg.Watch(), housekeepingTicker.C, syncWorkQueueCh.C)
 	go e.server.ListenAndServe(e, e.resourceAnalyzer, true)
 
@@ -355,8 +376,7 @@ func (e *edged) Start() {
 		return
 	}
 	e.logManager.Start()
-	stopChan := make(chan struct{})
-	e.runtimeClassManager.Start(stopChan)
+	e.runtimeClassManager.Start(utilwait.NeverStop)
 	klog.Infof("starting syncPod")
 	e.syncPod()
 }
@@ -411,6 +431,12 @@ func (e *edged) cgroupRoots() []string {
 
 //newEdged creates new edged object and initialises it
 func newEdged(enable bool) (*edged, error) {
+	// skip init edged if disabled
+	if !enable {
+		return &edged{
+			enable: enable,
+		}, nil
+	}
 	backoff := flowcontrol.NewBackOff(backOffPeriod, MaxContainerBackOff)
 
 	podManager := podmanager.NewPodManager()
@@ -426,6 +452,7 @@ func newEdged(enable bool) (*edged, error) {
 
 	ed := &edged{
 		nodeName:                  edgedconfig.Config.HostnameOverride,
+		customInterfaceName:       edgedconfig.Config.CustomInterfaceName,
 		namespace:                 edgedconfig.Config.RegisterNodeNamespace,
 		containerRuntimeName:      edgedconfig.Config.RuntimeType,
 		gpuPluginEnabled:          edgedconfig.Config.GPUPluginEnabled,
@@ -438,7 +465,7 @@ func newEdged(enable bool) (*edged, error) {
 		podDeletionQueue:          workqueue.New(),
 		podDeletionBackoff:        backoff,
 		metaClient:                metaClient,
-		kubeClient:                fakekube.NewSimpleClientset(metaClient),
+		kubeClient:                clientbridge.NewSimpleClientset(metaClient),
 		nodeStatusUpdateFrequency: time.Duration(edgedconfig.Config.NodeStatusUpdateFrequency) * time.Second,
 		mounter:                   mount.New(""),
 		uid:                       types.UID("38796d14-1df3-11e8-8e5a-286ed488f209"),
@@ -459,11 +486,12 @@ func newEdged(enable bool) (*edged, error) {
 	}
 
 	ed.livenessManager = proberesults.NewManager()
+	ed.readinessManager = proberesults.NewManager()
 	ed.startupManager = proberesults.NewManager()
 
 	nodeRef := &v1.ObjectReference{
 		Kind:      "Node",
-		Name:      string(ed.nodeName),
+		Name:      ed.nodeName,
 		UID:       types.UID(ed.nodeName),
 		Namespace: "",
 	}
@@ -474,7 +502,177 @@ func newEdged(enable bool) (*edged, error) {
 		MaxPerPodContainer: int(edgedconfig.Config.MaximumDeadContainersPerPod),
 	}
 
-	//create and start the docker shim running as a grpc server
+	//create and start the docker shim running as a grpc server, and initialize dockerLegacyService
+	if err := ed.startDockerServer(); err != nil {
+		return nil, err
+	}
+
+	ed.clusterDNS = convertStrToIP(edgedconfig.Config.ClusterDNS)
+	ed.dnsConfigurer = kubedns.NewConfigurer(recorder,
+		nodeRef,
+		[]net.IP{ed.nodeIP},
+		ed.clusterDNS,
+		edgedconfig.Config.ClusterDomain,
+		ResolvConfDefault)
+
+	httpClient := &http.Client{}
+	runtimeService, imageService, err := DefaultGetRuntimeService(
+		edgedconfig.Config.RemoteRuntimeEndpoint,
+		edgedconfig.Config.RemoteImageEndpoint,
+		metav1.Duration{
+			Duration: time.Duration(edgedconfig.Config.RuntimeRequestTimeout) * time.Minute,
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	if ed.os == nil {
+		ed.os = kubecontainer.RealOS{}
+	}
+
+	ed.clcm, err = clcm.NewContainerLifecycleManager(DefaultRootDir)
+	if err != nil {
+		return nil, err
+	}
+
+	useLegacyCadvisorStats := cadvisor.UsingLegacyCadvisorStats(edgedconfig.Config.RuntimeType, edgedconfig.Config.RemoteRuntimeEndpoint)
+	if ed.cadvisor, err = ed.newCadvisor(useLegacyCadvisorStats); err != nil {
+		return nil, err
+	}
+	if ed.machineInfo, err = ed.newMachineInfo(); err != nil {
+		return nil, err
+	}
+	// Avoid adding timestamp to machine metrics when they're cached
+	// Please refer to the following K8s PRs for more details:
+	//    link: https://github.com/kubernetes/kubernetes/pull/95210#issuecomment-726143798
+	//    link: https://github.com/kubernetes/kubernetes/pull/97006
+	// Analysis of causes :
+	//   1. The cadvisor collects machine metrics when it launches and then caches them for later scrape.
+	//      It is assumed that as long as the machine is not restarted, the hardware will not change and so do the machine metrics.
+	//   2. This timestamp of the machine metrics should be set when they're scraped, not when they're cached.
+	//   3. If using the timestamp when the machine metrics are cached, the timestamp when these metrics are scraped will be outdated
+	//      which may cause issues like 'out of order sample' when sending these metrics to prometheus.
+	ed.machineInfo.Timestamp = time.Time{}
+
+	if ed.containerRuntimeName == kubetypes.RemoteContainerRuntime {
+		// create a log manager
+		logManager, err := logs.NewContainerLogManager(runtimeService, ed.os, "10Mi", 5)
+		if err != nil {
+			return nil, fmt.Errorf("new container log manager failed, err: %s", err.Error())
+		}
+		ed.logManager = logManager
+	} else {
+		ed.logManager = logs.NewStubContainerLogManager()
+	}
+
+	containerRuntime, err := kuberuntime.NewKubeGenericRuntimeManager(
+		recorder,
+		ed.livenessManager,
+		ed.readinessManager,
+		ed.startupManager,
+		"",
+		ed.machineInfo,
+		ed,
+		ed.os,
+		ed,
+		httpClient,
+		backoff,
+		false,
+		0,
+		0,
+		"",
+		"",
+		true,
+		metav1.Duration{Duration: 100 * time.Millisecond},
+		runtimeService,
+		imageService,
+		ed.clcm.InternalContainerLifecycle(),
+		ed.dockerLegacyService,
+		ed.logManager,
+		ed.runtimeClassManager,
+		false,
+		"",
+		nil,
+		0.8,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("new generic runtime manager failed, err: %s", err.Error())
+	}
+
+	if edgedconfig.Config.CgroupsPerQOS && edgedconfig.Config.CgroupRoot == "" {
+		klog.Info("--cgroups-per-qos enabled, but --cgroup-root was not specified.  defaulting to /")
+		edgedconfig.Config.CgroupRoot = "/"
+	}
+
+	containerManager, err := cm.NewContainerManager(mount.New(""),
+		ed.cadvisor,
+		cm.NodeConfig{
+			CgroupDriver:                      edgedconfig.Config.CGroupDriver,
+			SystemCgroupsName:                 edgedconfig.Config.SystemCgroups,
+			KubeletCgroupsName:                edgedconfig.Config.EdgeCoreCgroups,
+			ContainerRuntime:                  edgedconfig.Config.RuntimeType,
+			CgroupsPerQOS:                     edgedconfig.Config.CgroupsPerQOS,
+			KubeletRootDir:                    DefaultRootDir,
+			ExperimentalCPUManagerPolicy:      string(cpumanager.PolicyNone),
+			ExperimentalMemoryManagerPolicy:   "None",
+			CgroupRoot:                        edgedconfig.Config.CgroupRoot,
+			ExperimentalTopologyManagerPolicy: "none",
+			ExperimentalTopologyManagerScope:  "container",
+		},
+		false,
+		edgedconfig.Config.DevicePluginEnabled,
+		recorder)
+	if err != nil {
+		return nil, fmt.Errorf("init container manager failed with error: %v", err)
+	}
+
+	ed.containerRuntime = containerRuntime
+	ed.streamingRuntime = containerRuntime
+	ed.runner = containerRuntime
+	ed.containerManager = containerManager
+	ed.runtimeService = runtimeService
+
+	runtimeCache, err := kubecontainer.NewRuntimeCache(ed.containerRuntime)
+	if err != nil {
+		return nil, err
+	}
+	ed.runtimeCache = runtimeCache
+
+	ed.resourceAnalyzer = serverstats.NewResourceAnalyzer(ed, edgedconfig.Config.VolumeStatsAggPeriod, ed.recorder)
+
+	ed.statusManager = status.NewManager(ed.kubeClient, ed.podManager, ed, ed.metaClient)
+
+	ed.Provider = ed.newStatsProvider(useLegacyCadvisorStats, imageService)
+
+	imageGCManager, err := images.NewImageGCManager(
+		ed.containerRuntime,
+		ed.Provider,
+		recorder,
+		nodeRef,
+		policy,
+		edgedconfig.Config.PodSandboxImage,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize image manager: %v", err)
+	}
+	ed.imageGCManager = imageGCManager
+
+	containerGCManager, err := kubecontainer.NewContainerGC(
+		ed.containerRuntime,
+		containerGCPolicy,
+		edgedutil.NewSourcesReady(ed.isInitPodReady))
+	if err != nil {
+		return nil, fmt.Errorf("init Container GC Manager failed with error %s", err.Error())
+	}
+	ed.containerGCManager = containerGCManager
+
+	ed.podKiller = NewPodKiller(ed)
+
+	ed.server = server.NewServer(ed.podManager)
+	return ed, nil
+}
+
+func (e *edged) startDockerServer() error {
 	if edgedconfig.Config.RemoteRuntimeEndpoint == DockerShimEndpoint ||
 		edgedconfig.Config.RemoteRuntimeEndpoint == DockerShimEndpointDeprecated {
 		streamingConfig := &streaming.Config{
@@ -504,7 +702,7 @@ func newEdged(enable bool) (*edged, error) {
 		// from k8s getStreamingConfig()
 		streamingConfig.Addr = net.JoinHostPort("localhost", "0")
 
-		cgroupDriver := ed.cgroupDriver
+		cgroupDriver := e.cgroupDriver
 
 		ds, err := dockershim.NewDockerService(DockerClientConfig,
 			edgedconfig.Config.PodSandboxImage,
@@ -512,11 +710,10 @@ func newEdged(enable bool) (*edged, error) {
 			&pluginConfigs,
 			cgroupName,
 			cgroupDriver,
-			DockershimRootDir,
-			true)
+			DockershimRootDir)
 
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		klog.Infof("RemoteRuntimeEndpoint: %q, remoteImageEndpoint: %q",
@@ -525,188 +722,76 @@ func newEdged(enable bool) (*edged, error) {
 		klog.Info("Starting the GRPC server for the docker CRI shim.")
 		server := dockerremote.NewDockerServer(edgedconfig.Config.RemoteRuntimeEndpoint, ds)
 		if err := server.Start(); err != nil {
-			return nil, err
+			return err
 		}
+
 		// Create dockerLegacyService when the logging driver is not supported.
 		supported, err := ds.IsCRISupportedLogDriver()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !supported {
-			ed.dockerLegacyService = ds
+			e.dockerLegacyService = ds
 		}
 	}
-	ed.clusterDNS = convertStrToIP(edgedconfig.Config.ClusterDNS)
-	ed.dnsConfigurer = kubedns.NewConfigurer(recorder,
-		nodeRef,
-		ed.nodeIP,
-		ed.clusterDNS,
-		edgedconfig.Config.ClusterDomain,
-		ResolvConfDefault)
+	return nil
+}
 
-	httpClient := &http.Client{}
-	runtimeService, imageService, err := getRuntimeAndImageServices(
-		edgedconfig.Config.RemoteRuntimeEndpoint,
-		edgedconfig.Config.RemoteImageEndpoint,
-		metav1.Duration{
-			Duration: time.Duration(edgedconfig.Config.RuntimeRequestTimeout) * time.Minute,
-		})
-	if err != nil {
-		return nil, err
-	}
-	if ed.os == nil {
-		ed.os = kubecontainer.RealOS{}
-	}
-
-	ed.clcm, err = clcm.NewContainerLifecycleManager(DefaultRootDir)
-	if err != nil {
-		return nil, err
-	}
-
-	useLegacyCadvisorStats := cadvisor.UsingLegacyCadvisorStats(edgedconfig.Config.RuntimeType, edgedconfig.Config.RemoteRuntimeEndpoint)
+func (e *edged) newCadvisor(useLegacyCadvisorStats bool) (cadvisor.Interface, error) {
 	if edgedconfig.Config.EnableMetrics {
 		imageFsInfoProvider := cadvisor.NewImageFsInfoProvider(edgedconfig.Config.RuntimeType, edgedconfig.Config.RemoteRuntimeEndpoint)
-		cadvisorInterface, err := cadvisor.New(imageFsInfoProvider, ed.rootDirectory, ed.cgroupRoots(), useLegacyCadvisorStats)
-		if err != nil {
-			return nil, err
-		}
-		ed.cadvisor = cadvisorInterface
-
-		machineInfo, err := ed.cadvisor.MachineInfo()
-		if err != nil {
-			return nil, err
-		}
-		ed.machineInfo = machineInfo
-	} else {
-		cadvisorInterface, _ := edgecadvisor.New("")
-		ed.cadvisor = cadvisorInterface
-
-		var machineInfo cadvisorapi.MachineInfo
-		machineInfo.MemoryCapacity = uint64(edgedconfig.Config.EdgedMemoryCapacity)
-		ed.machineInfo = &machineInfo
-	}
-	// create a log manager
-	logManager, err := logs.NewContainerLogManager(runtimeService, ed.os, "10Mi", 5)
-	if err != nil {
-		return nil, fmt.Errorf("New container log manager failed, err: %s", err.Error())
+		return cadvisor.New(imageFsInfoProvider, e.rootDirectory, e.cgroupRoots(), useLegacyCadvisorStats)
 	}
 
-	ed.logManager = logManager
-
-	containerRuntime, err := kuberuntime.NewKubeGenericRuntimeManager(
-		recorder,
-		ed.livenessManager,
-		ed.startupManager,
-		"",
-		ed.machineInfo,
-		ed,
-		ed.os,
-		ed,
-		httpClient,
-		backoff,
-		false,
-		0,
-		0,
-		true,
-		metav1.Duration{Duration: 100 * time.Millisecond},
-		runtimeService,
-		imageService,
-		ed.clcm.InternalContainerLifecycle(),
-		nil,
-		ed.logManager,
-		ed.runtimeClassManager,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("New generic runtime manager failed, err: %s", err.Error())
-	}
-
-	if edgedconfig.Config.CgroupsPerQOS && edgedconfig.Config.CgroupRoot == "" {
-		klog.Info("--cgroups-per-qos enabled, but --cgroup-root was not specified.  defaulting to /")
-		edgedconfig.Config.CgroupRoot = "/"
-	}
-
-	containerManager, err := cm.NewContainerManager(mount.New(""),
-		ed.cadvisor,
-		cm.NodeConfig{
-			CgroupDriver:                      edgedconfig.Config.CGroupDriver,
-			SystemCgroupsName:                 edgedconfig.Config.SystemCgroups,
-			KubeletCgroupsName:                edgedconfig.Config.EdgeCoreCgroups,
-			ContainerRuntime:                  edgedconfig.Config.RuntimeType,
-			CgroupsPerQOS:                     edgedconfig.Config.CgroupsPerQOS,
-			KubeletRootDir:                    DefaultRootDir,
-			ExperimentalCPUManagerPolicy:      string(cpumanager.PolicyNone),
-			CgroupRoot:                        edgedconfig.Config.CgroupRoot,
-			ExperimentalTopologyManagerPolicy: "none",
-		},
-		false,
-		edgedconfig.Config.DevicePluginEnabled,
-		recorder)
-	if err != nil {
-		return nil, fmt.Errorf("init container manager failed with error: %v", err)
-	}
-
-	ed.containerRuntime = containerRuntime
-	ed.streamingRuntime = containerRuntime
-	ed.runner = containerRuntime
-	ed.containerManager = containerManager
-	ed.runtimeService = runtimeService
-
-	runtimeCache, err := kubecontainer.NewRuntimeCache(ed.containerRuntime)
+	cadvisorInterface, err := edgecadvisor.New("")
 	if err != nil {
 		return nil, err
 	}
-	ed.runtimeCache = runtimeCache
+	return cadvisorInterface, nil
+}
 
-	ed.resourceAnalyzer = serverstats.NewResourceAnalyzer(ed, edgedconfig.Config.VolumeStatsAggPeriod)
+func (e *edged) newMachineInfo() (*cadvisorapi.MachineInfo, error) {
+	if edgedconfig.Config.EnableMetrics {
+		return e.cadvisor.MachineInfo()
+	}
 
-	ed.statusManager = status.NewManager(ed.kubeClient, ed.podManager, ed, ed.metaClient)
+	var machineInfo cadvisorapi.MachineInfo
+	machineInfo.MemoryCapacity = uint64(edgedconfig.Config.EdgedMemoryCapacity)
+	return &machineInfo, nil
+}
+
+func (e *edged) newStatsProvider(useLegacyCadvisorStats bool, imageService internalapi.ImageManagerService) *stats.Provider {
+	// common provider to get host file system usage associated with a pod managed by kubelet
+	hostStatsProvider := stats.NewHostStatsProvider(kubecontainer.RealOS{}, func(podUID types.UID) (string, bool) {
+		return getEtcHostsPath(e.getPodDir(podUID)), e.containerRuntime.SupportsSingleFileMapping()
+	})
 
 	if useLegacyCadvisorStats {
-		ed.StatsProvider = stats.NewCadvisorStatsProvider(
-			ed.cadvisor,
-			ed.resourceAnalyzer,
-			ed.podManager,
-			ed.runtimeCache,
-			ed.containerRuntime,
-			ed.statusManager)
-	} else {
-		ed.StatsProvider = stats.NewCRIStatsProvider(
-			ed.cadvisor,
-			ed.resourceAnalyzer,
-			ed.podManager,
-			ed.runtimeCache,
-			ed.runtimeService,
-			imageService,
-			stats.NewLogMetricsService(),
-			kubecontainer.RealOS{})
+		return stats.NewCadvisorStatsProvider(
+			e.cadvisor,
+			e.resourceAnalyzer,
+			e.podManager,
+			e.runtimeCache,
+			e.containerRuntime,
+			e.statusManager,
+			hostStatsProvider)
 	}
 
-	imageGCManager, err := images.NewImageGCManager(
-		ed.containerRuntime,
-		ed.StatsProvider,
-		recorder,
-		nodeRef,
-		policy,
-		edgedconfig.Config.PodSandboxImage,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize image manager: %v", err)
-	}
-	ed.imageGCManager = imageGCManager
+	return stats.NewCRIStatsProvider(
+		e.cadvisor,
+		e.resourceAnalyzer,
+		e.podManager,
+		e.runtimeCache,
+		e.runtimeService,
+		imageService,
+		hostStatsProvider, true)
+}
 
-	containerGCManager, err := kubecontainer.NewContainerGC(
-		ed.containerRuntime,
-		containerGCPolicy,
-		edgedutil.NewSourcesReady(ed.isInitPodReady))
-	if err != nil {
-		return nil, fmt.Errorf("init Container GC Manager failed with error %s", err.Error())
-	}
-	ed.containerGCManager = containerGCManager
-
-	ed.podKiller = NewPodKiller(ed)
-
-	ed.server = server.NewServer(ed.podManager)
-	return ed, nil
+// getEtcHostsPath returns the full host-side path to a pod's generated /etc/hosts file
+func getEtcHostsPath(podDir string) string {
+	hostsFilePath := path.Join(podDir, "etc-hosts")
+	// Volume Mounts fail on Windows if it is not of the form C:/
+	return volumeutil.MakeAbsolutePath(runtime.GOOS, hostsFilePath)
 }
 
 func (e *edged) initializeModules() error {
@@ -717,12 +802,12 @@ func (e *edged) initializeModules() error {
 		if err := e.cadvisor.Start(); err != nil {
 			// Fail kubelet and rely on the babysitter to retry starting kubelet.
 			// TODO(random-liu): Add backoff logic in the babysitter
-			klog.Fatalf("Failed to start cAdvisor %v", err)
+			klog.Exitf("Failed to start cAdvisor %v", err)
 		}
 
 		// trigger on-demand stats collection once so that we have capacity information for ephemeral storage.
 		// ignore any errors, since if stats collection is not successful, the container manager will fail to start below.
-		e.StatsProvider.GetCgroupStats("/", true)
+		e.Provider.GetCgroupStats("/", true)
 	}
 	// Start container manager.
 	node, err := e.initialNode()
@@ -796,12 +881,35 @@ func (e *edged) syncLoopIteration(plegCh <-chan *pleg.PodLifecycleEvent, houseke
 					}
 				}
 				klog.Infof("Will restart pod [%s]", pod.Name)
-				key := types.NamespacedName{
-					Namespace: pod.Namespace,
-					Name:      pod.Name,
-				}
-				e.podAdditionQueue.Add(key.String())
+				e.podAdditionQueue.Add(pod.UID)
 			}
+
+		case update := <-e.readinessManager.Updates():
+			ready := update.Result == proberesults.Success
+			e.statusManager.SetContainerReadiness(update.PodUID, update.ContainerID, ready)
+			pod, ok := e.podManager.GetPodByUID(update.PodUID)
+			if !ok {
+				// If the pod no longer exists, ignore the update.
+				klog.V(4).InfoS("SyncLoop (probe): ignore irrelevant update",
+					"probe", "readiness", "status", map[bool]string{true: "ready", false: ""}[ready], "update", update)
+				break
+			}
+
+			e.podAdditionQueue.Add(pod.UID)
+
+		case update := <-e.startupManager.Updates():
+			started := update.Result == proberesults.Success
+			e.statusManager.SetContainerStartup(update.PodUID, update.ContainerID, started)
+			pod, ok := e.podManager.GetPodByUID(update.PodUID)
+			if !ok {
+				// If the pod no longer exists, ignore the update.
+				klog.V(4).InfoS("SyncLoop (probe): ignore irrelevant update",
+					"probe", "startup", "status", map[bool]string{true: "started", false: "unhealthy"}[started], "update", update)
+				break
+			}
+
+			e.podAdditionQueue.Add(pod.UID)
+
 		case plegEvent := <-plegCh:
 			if pod, ok := e.podManager.GetPodByUID(plegEvent.ID); ok {
 				if err := e.updatePodStatus(pod); err != nil {
@@ -825,11 +933,7 @@ func (e *edged) syncLoopIteration(plegCh <-chan *pleg.PodLifecycleEvent, houseke
 						}
 					}
 					klog.Infof("sync loop get event container died, restart pod [%s]", pod.Name)
-					key := types.NamespacedName{
-						Namespace: pod.Namespace,
-						Name:      pod.Name,
-					}
-					e.podAdditionQueue.Add(key.String())
+					e.podAdditionQueue.Add(pod.UID)
 				} else {
 					klog.Infof("sync loop get event [%s], ignore it now.", plegEvent.Type)
 				}
@@ -848,27 +952,11 @@ func (e *edged) syncLoopIteration(plegCh <-chan *pleg.PodLifecycleEvent, houseke
 			}
 			for _, pod := range podsToSync {
 				if !e.podIsTerminated(pod) {
-					key := types.NamespacedName{
-						Namespace: pod.Namespace,
-						Name:      pod.Name,
-					}
-					e.podAdditionQueue.Add(key.String())
+					e.podAdditionQueue.Add(pod.UID)
 				}
 			}
 		}
 	}
-}
-
-// NewNamespacedNameFromString parses the provided string and returns a NamespacedName
-func NewNamespacedNameFromString(s string) types.NamespacedName {
-	Separator := '/'
-	nn := types.NamespacedName{}
-	result := strings.Split(s, string(Separator))
-	if len(result) == 2 {
-		nn.Namespace = result[0]
-		nn.Name = result[1]
-	}
-	return nn
 }
 
 func (e *edged) podAddWorkerRun(consumers int) {
@@ -881,28 +969,28 @@ func (e *edged) podAddWorkerRun(consumers int) {
 					klog.Errorf("consumer: [%d], worker addition queue is shutting down!", i)
 					return
 				}
-				namespacedName := NewNamespacedNameFromString(item.(string))
-				podName := namespacedName.Name
-				klog.Infof("worker [%d] get pod addition item [%s]", i, podName)
-				backOffKey := fmt.Sprintf("pod_addition_worker_%s", podName)
+
+				podUID := item.(types.UID)
+				klog.Infof("worker [%d] get pod addition item [%s]", i, podUID)
+				backOffKey := fmt.Sprintf("pod_addition_worker_%s", podUID)
 				if e.podAdditionBackoff.IsInBackOffSinceUpdate(backOffKey, e.podAdditionBackoff.Clock.Now()) {
-					klog.Errorf("consume pod addition backoff: Back-off consume pod [%s] addition  error, backoff: [%v]", podName, e.podAdditionBackoff.Get(backOffKey))
+					klog.Errorf("consume pod addition backoff: Back-off consume pod [%s] addition  error, backoff: [%v]", podUID, e.podAdditionBackoff.Get(backOffKey))
 					go func() {
-						klog.Infof("worker [%d] backoff pod addition item [%s] failed, re-add to queue", i, podName)
+						klog.Infof("worker [%d] backoff pod addition item [%s] failed, re-add to queue", i, podUID)
 						time.Sleep(e.podAdditionBackoff.Get(backOffKey))
 						e.podAdditionQueue.Add(item)
 					}()
 					e.podAdditionQueue.Done(item)
 					continue
 				}
-				err := e.consumePodAddition(&namespacedName)
+				err := e.consumePodAddition(podUID)
 				if err != nil {
 					if err == apis.ErrPodNotFound {
-						klog.Infof("worker [%d] handle pod addition item [%s] failed with not found error.", i, podName)
+						klog.Errorf("worker [%d] handle pod addition item [%s] failed with not found error.", i, podUID)
 						e.podAdditionBackoff.Reset(backOffKey)
 					} else {
 						go func() {
-							klog.Errorf("worker [%d] handle pod addition item [%s] failed: %v, re-add to queue", i, podName, err)
+							klog.Errorf("worker [%d] handle pod addition item [%s] failed: %v, re-add to queue", i, podUID, err)
 							e.podAdditionBackoff.Next(backOffKey, e.podAdditionBackoff.Clock.Now())
 							time.Sleep(enqueueDuration)
 							e.podAdditionQueue.Add(item)
@@ -926,18 +1014,19 @@ func (e *edged) podRemoveWorkerRun(consumers int) {
 					klog.Errorf("consumer: [%d], worker addition queue is shutting down!", i)
 					return
 				}
-				namespacedName := NewNamespacedNameFromString(item.(string))
-				podName := namespacedName.Name
-				klog.Infof("consumer: [%d], worker get removed pod [%s]\n", i, podName)
-				err := e.consumePodDeletion(&namespacedName)
+
+				podUID := item.(types.UID)
+
+				klog.Infof("consumer: [%d], worker get removed pod [%s]\n", i, podUID)
+				err := e.consumePodDeletion(podUID)
 				if err != nil {
 					if err == apis.ErrContainerNotFound {
-						klog.Infof("pod [%s] is not exist, with container not found error", podName)
+						klog.Infof("pod [%s] is not exist, with container not found error", podUID)
 					} else if err == apis.ErrPodNotFound {
-						klog.Infof("pod [%s] is not found", podName)
+						klog.Infof("pod [%s] is not found", podUID)
 					} else {
 						go func(item interface{}) {
-							klog.Errorf("worker remove pod [%s] failed: %v", podName, err)
+							klog.Errorf("worker remove pod [%s] failed: %v", podUID, err)
 							time.Sleep(2 * time.Second)
 							e.podDeletionQueue.Add(item)
 						}(item)
@@ -949,38 +1038,32 @@ func (e *edged) podRemoveWorkerRun(consumers int) {
 	}
 }
 
-func (e *edged) consumePodAddition(namespacedName *types.NamespacedName) error {
-	podName := namespacedName.Name
-	klog.Infof("start to consume added pod [%s]", podName)
-	pod, ok := e.podManager.GetPodByName(namespacedName.Namespace, podName)
+func (e *edged) consumePodAddition(podUID types.UID) error {
+	pod, ok := e.podManager.GetPodByUID(podUID)
 	if !ok || pod.DeletionTimestamp != nil {
 		return apis.ErrPodNotFound
 	}
 
+	klog.Infof("start to consume added pod [%s]", format.Pod(pod))
+
 	if err := e.makePodDataDirs(pod); err != nil {
-		klog.Errorf("Unable to make pod data directories for pod %q: %v", format.Pod(pod), err)
-		return err
+		return fmt.Errorf("unable to make pod data directories for pod %q: %v", format.Pod(pod), err)
 	}
 
 	if err := e.volumeManager.WaitForAttachAndMount(pod); err != nil {
-		klog.Errorf("Unable to mount volumes for pod %q: %v; skipping pod", format.Pod(pod), err)
-		return err
+		return fmt.Errorf("unable to mount volumes for pod %q: %v; skipping pod", format.Pod(pod), err)
 	}
 
-	secrets, err := e.getSecretsFromMetaManager(pod)
-	if err != nil {
-		return err
-	}
+	// Fetch the pull secrets for the pod
+	secrets := e.getImagePullSecretsForPod(pod)
 
-	podUID := pod.GetUID()
 	t, ok := e.podLastSyncTime.Load(podUID)
 	if !ok {
 		t = time.Time{}
 	}
 	curPodStatus, err := e.podCache.GetNewerThan(podUID, t.(time.Time))
 	if err != nil {
-		klog.Errorf("pod %s cache newer failed: %v", podName, err)
-		return err
+		return fmt.Errorf("pod %s cache newer failed: %v", format.Pod(pod), err)
 	}
 	result := e.containerRuntime.SyncPod(pod, curPodStatus, secrets, e.podAdditionBackoff)
 	e.podLastSyncTime.Store(podUID, time.Now())
@@ -989,8 +1072,8 @@ func (e *edged) consumePodAddition(namespacedName *types.NamespacedName) error {
 		for _, r := range result.SyncResults {
 			if r.Error != kubecontainer.ErrCrashLoopBackOff && r.Error != images.ErrImagePullBackOff {
 				// Do not record an event here, as we keep all event logging for sync pod failures
-				// local to container runtime so we get better errors
-				return err
+				// local to container runtime, so we get better errors
+				return fmt.Errorf("sync pod %s failed: %v", format.Pod(pod), err)
 			}
 		}
 
@@ -998,22 +1081,21 @@ func (e *edged) consumePodAddition(namespacedName *types.NamespacedName) error {
 	}
 
 	e.workQueue.Enqueue(pod.UID, utilwait.Jitter(time.Minute, workerResyncIntervalJitterFactor))
-	klog.Infof("consume added pod [%s] successfully\n", podName)
+	klog.Infof("consume added pod %s successfully\n", format.Pod(pod))
 	return nil
 }
 
-func (e *edged) consumePodDeletion(namespacedName *types.NamespacedName) error {
-	podName := namespacedName.Name
-	klog.Infof("start to consume removed pod [%s]", podName)
-	pod, ok := e.podManager.GetPodByName(namespacedName.Namespace, podName)
+func (e *edged) consumePodDeletion(podUID types.UID) error {
+	pod, ok := e.podManager.GetPodByUID(podUID)
 	if !ok {
 		return apis.ErrPodNotFound
 	}
 
+	klog.Infof("start to consume removed pod [%s]", format.Pod(pod))
+
 	podStatus, err := e.podCache.Get(pod.GetUID())
 	if err != nil {
-		klog.Errorf("Pod status for %s from cache failed: %v", podName, err)
-		return err
+		return fmt.Errorf("pod status for %s from cache failed: %v", format.Pod(pod), err)
 	}
 
 	e.podLastSyncTime.Delete(pod.GetUID())
@@ -1022,9 +1104,9 @@ func (e *edged) consumePodDeletion(namespacedName *types.NamespacedName) error {
 		if err == apis.ErrContainerNotFound {
 			return err
 		}
-		return fmt.Errorf("consume removed pod [%s] failed, %v", podName, err)
+		return fmt.Errorf("consume removed pod [%s] failed, %v", format.Pod(pod), err)
 	}
-	klog.Infof("consume removed pod [%s] successfully\n", podName)
+	klog.Infof("consume removed pod [%s] successfully\n", format.Pod(pod))
 	return nil
 }
 
@@ -1034,7 +1116,7 @@ func (e *edged) syncPod() {
 	//when starting, send msg to metamanager once to get existing pods
 	info := model.NewMessage("").BuildRouter(e.Name(), e.Group(), e.namespace+"/"+model.ResourceTypePod,
 		model.QueryOperation)
-	beehiveContext.Send(metamanager.MetaManagerModuleName, *info)
+	beehiveContext.Send(modules.MetaManagerModuleName, *info)
 	for {
 		select {
 		case <-beehiveContext.Done():
@@ -1055,22 +1137,15 @@ func (e *edged) syncPod() {
 		}
 		op := result.GetOperation()
 
-		var content []byte
-
-		switch result.Content.(type) {
-		case []byte:
-			content = result.GetContent().([]byte)
-		default:
-			content, err = json.Marshal(result.Content)
-			if err != nil {
-				klog.Errorf("marshal message content failed: %v", err)
-				continue
-			}
+		content, err := result.GetContentData()
+		if err != nil {
+			klog.Errorf("get message content data failed: %v", err)
+			continue
 		}
-		klog.Infof("result content is %s", result.Content)
+		klog.V(4).Infof("result content is %s", result.Content)
 		switch resType {
 		case model.ResourceTypePod:
-			if op == model.ResponseOperation && resID == "" && result.GetSource() == metamanager.MetaManagerModuleName {
+			if op == model.ResponseOperation && resID == "" && result.GetSource() == modules.MetaManagerModuleName {
 				err := e.handlePodListFromMetaManager(content)
 				if err != nil {
 					klog.Errorf("handle podList failed: %v", err)
@@ -1098,7 +1173,7 @@ func (e *edged) syncPod() {
 					klog.Errorf("handle configMap failed: %v", err)
 				}
 			} else {
-				klog.Infof("skip to handle configMap with type response")
+				klog.V(4).Infof("skip to handle configMap with type response")
 				continue
 			}
 		case model.ResourceTypeSecret:
@@ -1108,7 +1183,7 @@ func (e *edged) syncPod() {
 					klog.Errorf("handle secret failed: %v", err)
 				}
 			} else {
-				klog.Infof("skip to handle secret with type response")
+				klog.V(4).Infof("skip to handle secret with type response")
 				continue
 			}
 		case constants.CSIResourceTypeVolume:
@@ -1121,7 +1196,7 @@ func (e *edged) syncPod() {
 				beehiveContext.SendResp(*resp)
 			}
 		default:
-			klog.Errorf("resType is not pod or configmap or secret or volume: esType is %s", resType)
+			klog.Errorf("resType is not pod or configmap or secret or volume: resType is %s", resType)
 			continue
 		}
 	}
@@ -1145,16 +1220,14 @@ func (e *edged) createVolume(content []byte) (interface{}, error) {
 	req := &csi.CreateVolumeRequest{}
 	err := jsonpb.Unmarshal(bytes.NewReader(content), req)
 	if err != nil {
-		klog.Errorf("unmarshal create volume req error: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("unmarshal create volume req error: %v", err)
 	}
 
 	klog.V(4).Infof("start create volume: %s", req.Name)
 	ctl := csiplugin.NewController()
 	res, err := ctl.CreateVolume(req)
 	if err != nil {
-		klog.Errorf("create volume error: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("create volume error: %v", err)
 	}
 	klog.V(4).Infof("end create volume: %s result: %v", req.Name, res)
 	return res, nil
@@ -1164,15 +1237,13 @@ func (e *edged) deleteVolume(content []byte) (interface{}, error) {
 	req := &csi.DeleteVolumeRequest{}
 	err := jsonpb.Unmarshal(bytes.NewReader(content), req)
 	if err != nil {
-		klog.Errorf("unmarshal delete volume req error: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("unmarshal delete volume req error: %v", err)
 	}
 	klog.V(4).Infof("start delete volume: %s", req.VolumeId)
 	ctl := csiplugin.NewController()
 	res, err := ctl.DeleteVolume(req)
 	if err != nil {
-		klog.Errorf("delete volume error: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("delete volume error: %v", err)
 	}
 	klog.V(4).Infof("end delete volume: %s result: %v", req.VolumeId, res)
 	return res, nil
@@ -1182,15 +1253,13 @@ func (e *edged) controllerPublishVolume(content []byte) (interface{}, error) {
 	req := &csi.ControllerPublishVolumeRequest{}
 	err := jsonpb.Unmarshal(bytes.NewReader(content), req)
 	if err != nil {
-		klog.Errorf("unmarshal controller publish volume req error: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("unmarshal controller publish volume req error: %v", err)
 	}
 	klog.V(4).Infof("start controller publish volume: %s", req.VolumeId)
 	ctl := csiplugin.NewController()
 	res, err := ctl.ControllerPublishVolume(req)
 	if err != nil {
-		klog.Errorf("controller publish volume error: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("controller publish volume error: %v", err)
 	}
 	klog.V(4).Infof("end controller publish volume:: %s result: %v", req.VolumeId, res)
 	return res, nil
@@ -1200,15 +1269,13 @@ func (e *edged) controllerUnpublishVolume(content []byte) (interface{}, error) {
 	req := &csi.ControllerUnpublishVolumeRequest{}
 	err := jsonpb.Unmarshal(bytes.NewReader(content), req)
 	if err != nil {
-		klog.Errorf("unmarshal controller publish volume req error: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("unmarshal controller publish volume req error: %v", err)
 	}
 	klog.V(4).Infof("start controller unpublish volume: %s", req.VolumeId)
 	ctl := csiplugin.NewController()
 	res, err := ctl.ControllerUnpublishVolume(req)
 	if err != nil {
-		klog.Errorf("controller unpublish volume error: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("controller unpublish volume error: %v", err)
 	}
 	klog.V(4).Infof("end controller unpublish volume:: %s result: %v", req.VolumeId, res)
 	return res, nil
@@ -1221,22 +1288,35 @@ func (e *edged) handlePod(op string, content []byte) (err error) {
 		return err
 	}
 
-	switch op {
-	case model.InsertOperation:
-		e.addPod(&pod)
-	case model.UpdateOperation:
-		e.updatePod(&pod)
-	case model.DeleteOperation:
-		if delPod, ok := e.podManager.GetPodByName(pod.Namespace, pod.Name); ok {
+	// When the edge node is offline and the pod in the node is deleted forcefully,
+	// and then we make the node online, We do not have the pod full information
+	// because the pod is deleted from the kube apiServer, then the syncController
+	// will send a message with the pod name, namespace and UID, so we can not filter
+	// pod according to the node name, if the pod exist in the podManager, it indicates
+	// that the pod is belong to this edge node, so we can delete pod from the edged,
+	// otherwise the pod is not belong to the node, we just return.
+	if op == model.DeleteOperation {
+		if delPod, ok := e.podManager.GetPodByUID(pod.UID); ok {
 			e.deletePod(delPod)
 		}
+		return nil
 	}
+
+	if filterPodByNodeName(&pod, e.nodeName) {
+		switch op {
+		case model.InsertOperation:
+			e.addPod(&pod)
+		case model.UpdateOperation:
+			e.updatePod(&pod)
+		}
+	}
+
 	return nil
 }
 
 func (e *edged) handlePodListFromMetaManager(content []byte) (err error) {
 	var lists []string
-	err = json.Unmarshal([]byte(content), &lists)
+	err = json.Unmarshal(content, &lists)
 	if err != nil {
 		return err
 	}
@@ -1247,10 +1327,12 @@ func (e *edged) handlePodListFromMetaManager(content []byte) (err error) {
 		if err != nil {
 			return err
 		}
-		e.addPod(&pod)
-		if err = e.updatePodStatus(&pod); err != nil {
-			klog.Errorf("handlePodListFromMetaManager: update pod %s status error", pod.Name)
-			return err
+		if filterPodByNodeName(&pod, e.nodeName) {
+			e.addPod(&pod)
+			if err = e.updatePodStatus(&pod); err != nil {
+				klog.Errorf("handlePodListFromMetaManager: update pod %s status error", pod.Name)
+				return err
+			}
 		}
 	}
 
@@ -1258,13 +1340,15 @@ func (e *edged) handlePodListFromMetaManager(content []byte) (err error) {
 }
 
 func (e *edged) handlePodListFromEdgeController(content []byte) (err error) {
-	var lists []v1.Pod
-	if err := json.Unmarshal(content, &lists); err != nil {
+	var podLists []v1.Pod
+	if err := json.Unmarshal(content, &podLists); err != nil {
 		return err
 	}
 
-	for _, list := range lists {
-		e.addPod(&list)
+	for _, pod := range podLists {
+		if filterPodByNodeName(&pod, e.nodeName) {
+			e.addPod(&pod)
+		}
 	}
 
 	return nil
@@ -1279,29 +1363,22 @@ func (e *edged) addPod(obj interface{}) {
 	attrs.OtherPods = otherpods
 	nodeInfo := schedulercache.NewNodeInfo(pod)
 	e.containerManager.UpdatePluginResources(nodeInfo, attrs)
-	key := types.NamespacedName{
-		Namespace: pod.Namespace,
-		Name:      pod.Name,
-	}
 	e.podManager.AddPod(pod)
 	e.probeManager.AddPod(pod)
-	e.podAdditionQueue.Add(key.String())
+	e.podAdditionQueue.Add(pod.UID)
 	klog.Infof("success sync addition for pod [%s]", pod.Name)
 }
 
 func (e *edged) updatePod(obj interface{}) {
 	newPod := obj.(*v1.Pod)
 	klog.Infof("start update pod [%s]", newPod.Name)
-	key := types.NamespacedName{
-		Namespace: newPod.Namespace,
-		Name:      newPod.Name,
-	}
+
 	e.podManager.UpdatePod(newPod)
 	e.probeManager.AddPod(newPod)
 	if newPod.DeletionTimestamp == nil {
-		e.podAdditionQueue.Add(key.String())
+		e.podAdditionQueue.Add(newPod.UID)
 	} else {
-		e.podDeletionQueue.Add(key.String())
+		e.podDeletionQueue.Add(newPod.UID)
 	}
 	klog.Infof("success update pod is %+v\n", newPod)
 }
@@ -1315,17 +1392,18 @@ func (e *edged) deletePod(obj interface{}) {
 	klog.Infof("success remove pod [%s]", pod.Name)
 }
 
-func (e *edged) getSecretsFromMetaManager(pod *v1.Pod) ([]v1.Secret, error) {
+func (e *edged) getImagePullSecretsForPod(pod *v1.Pod) []v1.Secret {
 	var secrets []v1.Secret
 	for _, imagePullSecret := range pod.Spec.ImagePullSecrets {
 		secret, err := e.metaClient.Secrets(pod.Namespace).Get(imagePullSecret.Name)
 		if err != nil {
-			return nil, err
+			klog.Warningf("Unable to retrieve pull secret %s/%s for %s/%s due to %v.  The image pull may not succeed.", pod.Namespace, imagePullSecret.Name, pod.Namespace, pod.Name, err)
+			continue
 		}
 		secrets = append(secrets, *secret)
 	}
 
-	return secrets, nil
+	return secrets
 }
 
 // Get pods which should be resynchronized. Currently, the following pod should be resynchronized:
@@ -1398,7 +1476,7 @@ func (e *edged) handleSecret(op string, content []byte) (err error) {
 	return
 }
 
-// ProbeVolumePlugins collects all volume plugins into an easy to use list.
+// ProbeVolumePlugins collects all volume plugins into an easy-to-use list.
 // PluginDir specifies the directory to search for additional third party
 // volume plugins.
 func ProbeVolumePlugins(pluginDir string) []volume.VolumePlugin {
@@ -1459,7 +1537,7 @@ func (e *edged) HandlePodCleanups() error {
 	e.removeOrphanedPodStatuses(pods)
 	err = e.cleanupOrphanedPodDirs(pods, containerRunningPods)
 	if err != nil {
-		return fmt.Errorf("Failed cleaning up orphaned pod directories: %s", err.Error())
+		return fmt.Errorf("failed cleaning up orphaned pod directories: %s", err.Error())
 	}
 
 	return nil
@@ -1474,4 +1552,8 @@ func convertStrToIP(s string) []net.IP {
 		}
 	}
 	return ips
+}
+
+func filterPodByNodeName(pod *v1.Pod, nodeName string) bool {
+	return pod.Spec.NodeName == nodeName
 }

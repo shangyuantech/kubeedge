@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright 2020 The KubeEdge Authors.
+# Copyright 2021 The KubeEdge Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,16 +17,17 @@
 KUBEEDGE_ROOT=$PWD
 WORKDIR=$(dirname $0)
 E2E_DIR=$(realpath $(dirname $0)/..)
+IMAGE_TAG=$(git describe --tags)
+KUBEEDGE_VERSION=$IMAGE_TAG
 
 function cleanup() {
   sudo pkill edgecore || true
-  sudo pkill cloudcore || true
+  helm uninstall cloudcore -n kubeedge && kubectl delete ns kubeedge  || true
   kind delete cluster --name test
   sudo rm -rf /var/log/kubeedge /etc/kubeedge /etc/systemd/system/edgecore.service $E2E_DIR/keadm/keadm.test $E2E_DIR/config.json
 }
 
-function build_keadm() {
-  make all WHAT=keadm
+function build_ginkgo() {
   cd $E2E_DIR
   ginkgo build -r keadm/
 }
@@ -43,36 +44,33 @@ function prepare_cluster() {
   kubectl delete daemonset kindnet -nkube-system
 }
 
+function build_image() {
+  cd $KUBEEDGE_ROOT
+  make image WHAT=cloudcore -f $KUBEEDGE_ROOT/Makefile
+  make image WHAT=installation-package -f $KUBEEDGE_ROOT/Makefile
+  kind load docker-image kubeedge/cloudcore:$IMAGE_TAG --name test
+  kind load docker-image kubeedge/installation-package:$IMAGE_TAG --name test
+}
+
 function start_kubeedge() {
   sudo mkdir -p /var/lib/kubeedge
   cd $KUBEEDGE_ROOT
+  export MASTER_IP=`kubectl get node test-control-plane -o jsonpath={.status.addresses[0].address}`
   export KUBECONFIG=$HOME/.kube/config
+  docker run --rm kubeedge/installation-package:$IMAGE_TAG cat /usr/local/bin/keadm > /usr/local/bin/keadm && chmod +x /usr/local/bin/keadm
 
-  sudo -E _output/local/bin/keadm init --kube-config=$KUBECONFIG --advertise-address=127.0.0.1
-  export MASTER_IP=`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' test-control-plane`
-
+  /usr/local/bin/keadm init --advertise-address=$MASTER_IP --profile version=$KUBEEDGE_VERSION --set cloudCore.service.enable=false --kube-config=$KUBECONFIG --force
+  
   # ensure tokensecret is generated
   while true; do
       sleep 3
       kubectl get secret -nkubeedge 2>/dev/null | grep -q tokensecret && break
   done
-
-  export TOKEN=$(sudo _output/local/bin/keadm gettoken --kube-config=$KUBECONFIG)
+  
+  cd $KUBEEDGE_ROOT
+  export TOKEN=$(sudo /usr/local/bin/keadm gettoken --kube-config=$KUBECONFIG)
   sudo systemctl set-environment CHECK_EDGECORE_ENVIRONMENT="false"
-  sudo -E CHECK_EDGECORE_ENVIRONMENT="false" _output/local/bin/keadm join --token=$TOKEN --cloudcore-ipport=127.0.0.1:10000 --edgenode-name=edge-node
-
-  #Pre-configurations required for running the suite.
-  #Any new config addition required corresponding code changes.
-  cat > $E2E_DIR/config.json <<END
-{
-        "image_url": ["nginx", "nginx"],
-        "k8smasterforkubeedge":"https://$MASTER_IP:6443",
-        "dockerhubusername":"user",
-        "dockerhubpassword":"password",
-        "mqttendpoint":"tcp://127.0.0.1:1884",
-        "kubeconfigpath":"$KUBECONFIG"
-}
-END
+  sudo -E CHECK_EDGECORE_ENVIRONMENT="false" /usr/local/bin/keadm join --token=$TOKEN --cloudcore-ipport=$MASTER_IP:10000 --edgenode-name=edge-node --kubeedge-version=$KUBEEDGE_VERSION
 
   # ensure edgenode is ready
   while true; do
@@ -84,20 +82,16 @@ END
 function run_test() {
   :> /tmp/testcase.log
   cd $E2E_DIR
-  ./keadm/keadm.test $debugflag 2>&1 | tee -a /tmp/testcase.log
 
-  #stop the edgecore after the test completion
-  grep  -e "Running Suite" -e "SUCCESS\!" -e "FAIL\!" /tmp/testcase.log | sed -r 's/\x1B\[([0-9];)?([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g' | sed -r 's/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g'
-  echo "Integration Test Final Summary Report"
-  echo "======================================================="
-  echo "Total Number of Test cases = `grep "Ran " /tmp/testcase.log | awk '{sum+=$2} END {print sum}'`"
-  passed=`grep -e "SUCCESS\!" -e "FAIL\!" /tmp/testcase.log | awk '{print $3}' | sed -r "s/\x1B\[([0-9];)?([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g" | awk '{sum+=$1} END {print sum}'`
-  echo "Number of Test cases PASSED = $passed"
-  fail=`grep -e "SUCCESS\!" -e "FAIL\!" /tmp/testcase.log | awk '{print $6}' | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g" | awk '{sum+=$1} END {print sum}'`
-  echo "Number of Test cases FAILED = $fail"
-  echo "==================Result Summary======================="
+  export ACK_GINKGO_RC=true
 
-  if [ "$fail" != "0" ];then
+  ginkgo -v ./keadm/keadm.test -- \
+  --image-url=nginx \
+  --image-url=nginx \
+  --kube-master="https://$MASTER_IP:6443" \
+  --kubeconfig=$KUBECONFIG \
+  --test.v
+  if [[ $? != 0 ]]; then
       echo "Integration suite has failures, Please check !!"
       exit 1
   else
@@ -110,11 +104,19 @@ set -Ee
 trap cleanup EXIT
 trap cleanup ERR
 
-build_keadm
+echo -e "\nBuilding ginkgo test cases..."
+build_ginkgo
 
 export KUBECONFIG=$HOME/.kube/config
+
+echo -e "\nPreparing cluster..."
 prepare_cluster
 
+echo -e "\nBuilding cloud image..."
+build_image
+
+echo -e "\nStarting kubeedge..."
 start_kubeedge
 
+echo -e "\nRunning test..."
 run_test

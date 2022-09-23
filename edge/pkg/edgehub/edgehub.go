@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/beehive/pkg/core"
@@ -12,29 +13,45 @@ import (
 	"github.com/kubeedge/kubeedge/edge/pkg/edgehub/certificate"
 	"github.com/kubeedge/kubeedge/edge/pkg/edgehub/clients"
 	"github.com/kubeedge/kubeedge/edge/pkg/edgehub/config"
+
+	// register Upgrade handler
+	_ "github.com/kubeedge/kubeedge/edge/pkg/edgehub/upgrade"
 	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha1"
 )
-
-//define edgehub module name
-const (
-	ModuleNameEdgeHub = "websocket"
-)
-
-var HasTLSTunnelCerts = make(chan bool, 1)
 
 //EdgeHub defines edgehub object structure
 type EdgeHub struct {
 	certManager   certificate.CertManager
 	chClient      clients.Adapter
 	reconnectChan chan struct{}
+	rateLimiter   flowcontrol.RateLimiter
 	keeperLock    sync.RWMutex
 	enable        bool
 }
 
+var _ core.Module = (*EdgeHub)(nil)
+
+var certSync map[string]chan bool
+
+func GetCertSyncChannel() map[string]chan bool {
+	return certSync
+}
+
+func NewCertSyncChannel() map[string]chan bool {
+	certSync = make(map[string]chan bool, 2)
+	certSync[modules.EdgeStreamModuleName] = make(chan bool, 1)
+	certSync[modules.MetaManagerModuleName] = make(chan bool, 1)
+	return certSync
+}
+
 func newEdgeHub(enable bool) *EdgeHub {
+	NewCertSyncChannel()
 	return &EdgeHub{
-		reconnectChan: make(chan struct{}),
 		enable:        enable,
+		reconnectChan: make(chan struct{}),
+		rateLimiter: flowcontrol.NewTokenBucketRateLimiter(
+			float32(config.Config.EdgeHub.MessageQPS),
+			int(config.Config.EdgeHub.MessageBurst)),
 	}
 }
 
@@ -46,7 +63,7 @@ func Register(eh *v1alpha1.EdgeHub, nodeName string) {
 
 //Name returns the name of EdgeHub module
 func (eh *EdgeHub) Name() string {
-	return ModuleNameEdgeHub
+	return modules.EdgeHubModuleName
 }
 
 //Group returns EdgeHub group
@@ -63,9 +80,10 @@ func (eh *EdgeHub) Enable() bool {
 func (eh *EdgeHub) Start() {
 	eh.certManager = certificate.NewCertManager(config.Config.EdgeHub, config.Config.NodeName)
 	eh.certManager.Start()
-
-	HasTLSTunnelCerts <- true
-	close(HasTLSTunnelCerts)
+	for _, v := range GetCertSyncChannel() {
+		v <- true
+		close(v)
+	}
 
 	go eh.ifRotationDone()
 
@@ -78,7 +96,7 @@ func (eh *EdgeHub) Start() {
 		}
 		err := eh.initial()
 		if err != nil {
-			klog.Fatalf("failed to init controller: %v", err)
+			klog.Exitf("failed to init controller: %v", err)
 			return
 		}
 

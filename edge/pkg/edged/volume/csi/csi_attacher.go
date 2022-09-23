@@ -75,7 +75,7 @@ func (c *csiAttacher) Attach(spec *volume.Spec, nodeName types.NodeName) (string
 func (c *csiAttacher) WaitForAttach(spec *volume.Spec, _ string, pod *v1.Pod, timeout time.Duration) (string, error) {
 	source, err := getPVSourceFromSpec(spec)
 	if err != nil {
-		klog.Error(log("attacher.WaitForAttach failed to extract CSI volume source: %v", err))
+		klog.Error(log("attacher.WaitForAttach failed to extract CSI volume source of pod %v error: %v", pod.Name, err))
 		return "", err
 	}
 
@@ -87,14 +87,13 @@ func (c *csiAttacher) WaitForAttach(spec *volume.Spec, _ string, pod *v1.Pod, ti
 func (c *csiAttacher) waitForVolumeAttachment(volumeHandle, attachID string, timeout time.Duration) (string, error) {
 	klog.V(4).Info(log("probing for updates from CSI driver for [attachment.ID=%v]", attachID))
 
-	err := wait.PollImmediate(time.Second*5, time.Minute*5, func() (bool, error) {
+	err := wait.PollImmediate(time.Second*5, timeout, func() (bool, error) {
 		klog.V(4).Info(log("probing VolumeAttachment [id=%v]", attachID))
 		attach, err := c.k8s.StorageV1().VolumeAttachments().Get(context.Background(), attachID, meta.GetOptions{})
 		if err != nil {
 			return false, fmt.Errorf("volume %v has GET error for volume attachment %v: %v", volumeHandle, attachID, err)
 		}
-		successful, err := verifyAttachmentStatus(attach, volumeHandle)
-		return successful, err
+		return verifyAttachmentStatus(attach, volumeHandle)
 	})
 	if err != nil {
 		return "", err
@@ -166,7 +165,7 @@ func (c *csiAttacher) GetDeviceMountPath(spec *volume.Spec) (string, error) {
 	return deviceMountPath, nil
 }
 
-func (c *csiAttacher) MountDevice(spec *volume.Spec, devicePath string, deviceMountPath string) (err error) {
+func (c *csiAttacher) MountDevice(spec *volume.Spec, devicePath string, deviceMountPath string, deviceMounterArgs volume.DeviceMounterArgs) (err error) {
 	klog.V(4).Infof(log("attacher.MountDevice(%s, %s)", devicePath, deviceMountPath))
 
 	if deviceMountPath == "" {
@@ -219,7 +218,7 @@ func (c *csiAttacher) MountDevice(spec *volume.Spec, devicePath string, deviceMo
 			// clean up metadata
 			klog.Errorf(log("attacher.MountDevice failed: %v", err))
 			if err := removeMountDir(c.plugin, deviceMountPath); err != nil {
-				klog.Error(log("attacher.MountDevice failed to remove mount dir after errir [%s]: %v", deviceMountPath, err))
+				klog.Error(log("attacher.MountDevice failed to remove mount dir after error [%s]: %v", deviceMountPath, err))
 			}
 		}
 	}()

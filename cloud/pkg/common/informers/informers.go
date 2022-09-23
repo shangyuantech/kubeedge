@@ -29,13 +29,14 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
-	crdinformers "github.com/kubeedge/kubeedge/cloud/pkg/client/informers/externalversions"
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/client"
+	"github.com/kubeedge/kubeedge/common/constants"
+	crdinformers "github.com/kubeedge/kubeedge/pkg/client/informers/externalversions"
 )
 
 type newInformer func() cache.SharedIndexInformer
 
-type KubeEdgeCustomeInformer interface {
+type KubeEdgeCustomInformer interface {
 	EdgeNode() cache.SharedIndexInformer
 }
 
@@ -43,7 +44,7 @@ type Manager interface {
 	GetK8sInformerFactory() k8sinformer.SharedInformerFactory
 	GetCRDInformerFactory() crdinformers.SharedInformerFactory
 	GetDynamicSharedInformerFactory() dynamicinformer.DynamicSharedInformerFactory
-	KubeEdgeCustomeInformer
+	KubeEdgeCustomInformer
 	Start(stopCh <-chan struct{})
 }
 
@@ -88,7 +89,7 @@ func (ifs *informers) GetDynamicSharedInformerFactory() dynamicinformer.DynamicS
 
 func (ifs *informers) EdgeNode() cache.SharedIndexInformer {
 	return ifs.getInformer("edgenodesinformer", func() cache.SharedIndexInformer {
-		set := labels.Set{"node-role.kubernetes.io/edge": ""}
+		set := labels.Set{constants.EdgeNodeRoleKey: constants.EdgeNodeRoleValue}
 		selector := labels.SelectorFromSet(set)
 		optionModifier := func(options *metav1.ListOptions) {
 			options.LabelSelector = selector.String()
@@ -98,13 +99,14 @@ func (ifs *informers) EdgeNode() cache.SharedIndexInformer {
 	})
 }
 
-//please WaitForCache after getting a informer from factory, example:
+//Note: please WaitForCache after getting an informer from factory, example:
 //	informer := informerFactory.ForResource(gvr)
 //	for gvr, cacheSync := range informerFactory.WaitForCacheSync(beehiveContext.Done()) {
 //		if !cacheSync {
 //			klog.Fatalf("unable to sync caches for: %s", gvr.String())
 //		}
 //	}
+
 func (ifs *informers) Start(stopCh <-chan struct{}) {
 	ifs.lock.Lock()
 	defer ifs.lock.Unlock()
@@ -118,7 +120,7 @@ func (ifs *informers) Start(stopCh <-chan struct{}) {
 	ifs.dynamicSharedInformerFactory.Start(stopCh)
 }
 
-// getInformer get a informer named "name" or store a informer got by "newFunc" as key "name"
+// getInformer get an informer named "name" or store an informer got by "newFunc" as key "name"
 func (ifs *informers) getInformer(name string, newFunc newInformer) cache.SharedIndexInformer {
 	ifs.lock.Lock()
 	defer ifs.lock.Unlock()

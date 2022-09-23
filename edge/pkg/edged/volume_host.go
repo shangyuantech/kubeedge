@@ -39,11 +39,12 @@ import (
 	recordtools "k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
+	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util/hostutil"
 	"k8s.io/kubernetes/pkg/volume/util/subpath"
+	"k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
-	"k8s.io/utils/mount"
 )
 
 // NewInitializedVolumePluginMgr returns a new instance of volume.VolumePluginMgr
@@ -157,7 +158,9 @@ func (evh *edgedVolumeHost) GetSecretFunc() func(namespace, name string) (*api.S
 func (evh *edgedVolumeHost) GetVolumeDevicePluginDir(pluginName string) string { return "" }
 
 func (evh *edgedVolumeHost) DeleteServiceAccountTokenFunc() func(podUID types.UID) {
-	return func(types.UID) {}
+	return func(podUID types.UID) {
+		evh.edge.metaClient.ServiceAccountToken().DeleteServiceAccountToken(podUID)
+	}
 }
 
 func (evh *edgedVolumeHost) GetEventRecorder() recordtools.EventRecorder {
@@ -169,8 +172,8 @@ func (evh *edgedVolumeHost) GetPodsDir() string {
 }
 
 func (evh *edgedVolumeHost) GetServiceAccountTokenFunc() func(namespace, name string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
-	return func(_, _ string, _ *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
-		return nil, fmt.Errorf("GetServiceAccountToken unsupported")
+	return func(namespace, name string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+		return evh.edge.metaClient.ServiceAccountToken().GetServiceAccountToken(namespace, name, tr)
 	}
 }
 
@@ -202,5 +205,9 @@ func (evh *edgedVolumeHost) CSIDriversSynced() cache.InformerSynced {
 
 // WaitForCacheSync is a helper function that waits for cache sync for CSIDriverLister
 func (evh *edgedVolumeHost) WaitForCacheSync() error {
+	return nil
+}
+
+func (evh *edgedVolumeHost) GetFilteredDialOptions() *proxyutil.FilteredDialOptions {
 	return nil
 }

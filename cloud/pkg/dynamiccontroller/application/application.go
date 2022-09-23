@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	authorizationv1 "k8s.io/api/authorization/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -16,17 +19,24 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
+	authorizationv1client "k8s.io/client-go/kubernetes/typed/authorization/v1"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/kubeedge/beehive/pkg/core/model"
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/client"
+	"github.com/kubeedge/kubeedge/cloud/pkg/common/messagelayer"
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
-	"github.com/kubeedge/kubeedge/cloud/pkg/dynamiccontroller/messagelayer"
+	"github.com/kubeedge/kubeedge/cloud/pkg/dynamiccontroller/filter"
+	commontypes "github.com/kubeedge/kubeedge/common/types"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/message"
-	"github.com/kubeedge/kubeedge/edge/pkg/edgehub"
+	edgemodule "github.com/kubeedge/kubeedge/edge/pkg/common/modules"
+	metaserverconfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/config"
 	"github.com/kubeedge/kubeedge/pkg/metaserver"
 )
 
@@ -80,25 +90,27 @@ type PatchInfo struct {
 // 0.use Agent.Generate to generate application
 // 1.use Agent.Apply to apply application( generate msg and send it to cloud dynamiccontroller)
 type Application struct {
-	ID       string
-	Key      string // group version resource namespaces name
-	Verb     applicationVerb
-	Nodename string
-	Status   applicationStatus
-	Reason   string // why in this status
-	Option   []byte //
-	ReqBody  []byte // better a k8s api instance
-	RespBody []byte
-
-	ctx    context.Context // to end app.Wait
-	cancel context.CancelFunc
+	ID          string
+	Key         string // group version resource namespaces name
+	Verb        applicationVerb
+	Nodename    string
+	Status      applicationStatus
+	Reason      string // why in this status
+	Option      []byte //
+	ReqBody     []byte // better a k8s api instance
+	RespBody    []byte
+	Subresource string
+	Error       apierrors.StatusError
+	Token       string
+	ctx         context.Context // to end app.Wait
+	cancel      context.CancelFunc
 
 	count     uint64 // count the number of current citations
 	countLock sync.Mutex
-	//TODO: add lock
+	timestamp time.Time // record the last closing time of application, only make sense when count == 0
 }
 
-func newApplication(ctx context.Context, key string, verb applicationVerb, nodename string, option interface{}, reqBody interface{}) *Application {
+func newApplication(ctx context.Context, key string, verb applicationVerb, nodename, subresource string, option interface{}, reqBody interface{}) (*Application, error) {
 	var v1 metav1.ListOptions
 	if internal, ok := option.(metainternalversion.ListOptions); ok {
 		err := metainternalversion.Convert_internalversion_ListOptions_To_v1_ListOptions(&internal, &v1, nil)
@@ -108,21 +120,29 @@ func newApplication(ctx context.Context, key string, verb applicationVerb, noden
 		}
 		option = v1
 	}
+	token, ok := ctx.Value(commontypes.AuthorizationKey).(string)
+	if !ok {
+		klog.Errorf("unsupported Token type :%T", ctx.Value(commontypes.AuthorizationKey))
+		return nil, fmt.Errorf("unsupported Token type :%T", ctx.Value(commontypes.AuthorizationKey))
+	}
 	ctx2, cancel := context.WithCancel(ctx)
 	app := &Application{
-		Key:       key,
-		Verb:      verb,
-		Nodename:  nodename,
-		Status:    PreApplying,
-		Option:    toBytes(option),
-		ReqBody:   toBytes(reqBody),
-		ctx:       ctx2,
-		cancel:    cancel,
-		count:     0,
-		countLock: sync.Mutex{},
+		Key:         key,
+		Verb:        verb,
+		Nodename:    nodename,
+		Subresource: subresource,
+		Status:      PreApplying,
+		Option:      toBytes(option),
+		ReqBody:     toBytes(reqBody),
+		Token:       token,
+		ctx:         ctx2,
+		cancel:      cancel,
+		count:       0,
+		countLock:   sync.Mutex{},
+		timestamp:   time.Time{},
 	}
 	app.add()
-	return app
+	return app, nil
 }
 
 func (a *Application) Identifier() string {
@@ -239,10 +259,20 @@ func (a *Application) Close() {
 		return
 	}
 
+	a.timestamp = time.Now()
 	a.count--
 	if a.count == 0 {
 		a.Status = Completed
 	}
+}
+
+func (a *Application) LastCloseTime() time.Time {
+	a.countLock.Lock()
+	defer a.countLock.Unlock()
+	if a.count == 0 && !a.timestamp.IsZero() {
+		return a.timestamp
+	}
+	return time.Time{}
 }
 
 // used for generating application and do apply
@@ -252,30 +282,45 @@ type Agent struct {
 }
 
 // edged config.Config.HostnameOverride
-func NewApplicationAgent(nodeName string) *Agent {
-	return &Agent{nodeName: nodeName}
+func NewApplicationAgent() *Agent {
+	defaultAgent := &Agent{nodeName: metaserverconfig.Config.NodeName}
+
+	go wait.Until(func() {
+		defaultAgent.GC()
+	}, time.Minute*5, beehiveContext.Done())
+
+	return defaultAgent
 }
 
-func (a *Agent) Generate(ctx context.Context, verb applicationVerb, option interface{}, obj runtime.Object) *Application {
+func (a *Agent) Generate(ctx context.Context, verb applicationVerb, option interface{}, obj runtime.Object) (*Application, error) {
 	key, err := metaserver.KeyFuncReq(ctx, "")
 	if err != nil {
 		klog.Errorf("%v", err)
-		return &Application{}
+		return nil, err
 	}
-	app := newApplication(ctx, key, verb, a.nodeName, option, obj)
+
+	info, ok := apirequest.RequestInfoFrom(ctx)
+	if !ok || !info.IsResourceRequest {
+		klog.Errorf("no request info in context")
+		return nil, fmt.Errorf("no request info in context")
+	}
+	app, err := newApplication(ctx, key, verb, a.nodeName, info.Subresource, option, obj)
+	if err != nil {
+		return nil, err
+	}
 	store, ok := a.Applications.LoadOrStore(app.Identifier(), app)
 	if ok {
 		app = store.(*Application)
 		app.add()
-		return app
+		return app, nil
 	}
-	return app
+	return app, nil
 }
 
 func (a *Agent) Apply(app *Application) error {
 	store, ok := a.Applications.Load(app.Identifier())
 	if !ok {
-		return fmt.Errorf("Application %v has not been registered to agent", app.String())
+		return fmt.Errorf("application %v has not been registered to agent", app.String())
 	}
 	app = store.(*Application)
 	switch app.getStatus() {
@@ -284,7 +329,9 @@ func (a *Agent) Apply(app *Application) error {
 	case Completed:
 		app.Reset()
 		go a.doApply(app)
-	case Rejected, Failed:
+	case Rejected:
+		return &app.Error
+	case Failed:
 		return errors.New(app.Reason)
 	case Approved:
 		return nil
@@ -292,6 +339,9 @@ func (a *Agent) Apply(app *Application) error {
 		//continue
 	}
 	app.Wait()
+	if app.getStatus() == Rejected {
+		return &app.Error
+	}
 	if app.getStatus() != Approved {
 		return errors.New(app.Reason)
 	}
@@ -300,18 +350,16 @@ func (a *Agent) Apply(app *Application) error {
 
 func (a *Agent) doApply(app *Application) {
 	defer app.Call()
-
 	// encapsulate as a message
 	app.Status = InApplying
 	msg := model.NewMessage("").SetRoute(MetaServerSource, modules.DynamicControllerModuleGroup).FillBody(app)
 	msg.SetResourceOperation("null", "null")
-	resp, err := beehiveContext.SendSync(edgehub.ModuleNameEdgeHub, *msg, 10*time.Second)
+	resp, err := beehiveContext.SendSync(edgemodule.EdgeHubModuleName, *msg, 10*time.Second)
 	if err != nil {
 		app.Status = Failed
 		app.Reason = fmt.Sprintf("failed to access cloud Application center: %v", err)
 		return
 	}
-
 	retApp, err := msgToApplication(resp)
 	if err != nil {
 		app.Status = Failed
@@ -322,25 +370,33 @@ func (a *Agent) doApply(app *Application) {
 	//merge returned application to local application
 	app.Status = retApp.Status
 	app.Reason = retApp.Reason
+	app.Error = retApp.Error
 	app.RespBody = retApp.RespBody
 }
 
 func (a *Agent) GC() {
-
+	a.Applications.Range(func(key, value interface{}) bool {
+		app := value.(*Application)
+		lastCloseTime := app.LastCloseTime()
+		if !lastCloseTime.IsZero() && time.Since(lastCloseTime) >= time.Minute*5 {
+			a.Applications.Delete(key)
+		}
+		return true
+	})
 }
 
 type Center struct {
 	Applications sync.Map
 	HandlerCenter
 	messageLayer messagelayer.MessageLayer
-	kubeclient   dynamic.Interface
+	authConfig   *rest.Config
 }
 
 func NewApplicationCenter(dynamicSharedInformerFactory dynamicinformer.DynamicSharedInformerFactory) *Center {
 	a := &Center{
 		HandlerCenter: NewHandlerCenter(dynamicSharedInformerFactory),
-		kubeclient:    client.GetDynamicClient(),
-		messageLayer:  messagelayer.NewContextMessageLayer(),
+		authConfig:    client.GetAuthConfig(),
+		messageLayer:  messagelayer.DynamicControllerMessageLayer(),
 	}
 	return a
 }
@@ -364,7 +420,12 @@ func toBytes(i interface{}) (bytes []byte) {
 // extract application in message's Content
 func msgToApplication(msg model.Message) (*Application, error) {
 	var app = new(Application)
-	err := json.Unmarshal(toBytes(msg.Content), app)
+	contentData, err := msg.GetContentData()
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal(contentData, app)
 	if err != nil {
 		return nil, err
 	}
@@ -379,42 +440,113 @@ func (c *Center) Process(msg model.Message) {
 		klog.Errorf("failed to translate msg to Application: %v", err)
 		return
 	}
+
 	klog.Infof("[metaserver/ApplicationCenter] get a Application %v", app.String())
 
 	resp, err := c.ProcessApplication(app)
 	if err != nil {
-		c.Response(app, msg.GetID(), Rejected, err.Error(), nil)
+		c.Response(app, msg.GetID(), Rejected, err, nil)
 		klog.Errorf("[metaserver/applicationCenter]failed to process Application(%+v), %v", app, err)
 		return
 	}
-	c.Response(app, msg.GetID(), Approved, "", resp)
+	c.Response(app, msg.GetID(), Approved, nil, resp)
 	klog.Infof("[metaserver/applicationCenter]successfully to process Application(%+v)", app)
 }
 
+func (c *Center) generateNewConfig(raw string) (*rest.Config, error) {
+	parts := strings.SplitN(raw, " ", 3)
+	if len(parts) < 2 || strings.ToLower(parts[0]) != "bearer" || len(parts[1]) <= 0 {
+		return nil, fmt.Errorf("invalid request token format or length: %v", len(parts))
+	}
+	authConfig := rest.CopyConfig(c.authConfig)
+	authConfig.BearerToken = parts[1]
+	return authConfig, nil
+}
+
+func (c *Center) createAuthClient(app *Application) (authorizationv1client.AuthorizationV1Interface, error) {
+	authConfig, err := c.generateNewConfig(app.Token)
+	if err != nil {
+		return nil, err
+	}
+	return authorizationv1client.NewForConfigOrDie(authConfig), nil
+}
+
+func (c *Center) createKubeClient(app *Application) (dynamic.Interface, error) {
+	authConfig, err := c.generateNewConfig(app.Token)
+	if err != nil {
+		return nil, err
+	}
+	return dynamic.NewForConfigOrDie(authConfig), nil
+}
+
+func (c *Center) authorizeApplication(app *Application, gvr schema.GroupVersionResource, namespace string, name string) error {
+	tmpAuthClient, err := c.createAuthClient(app)
+	if err != nil {
+		return err
+	}
+	sar := &authorizationv1.SelfSubjectAccessReview{
+		Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+			ResourceAttributes: &authorizationv1.ResourceAttributes{
+				Namespace:   namespace,
+				Verb:        string(app.Verb),
+				Group:       gvr.Group,
+				Resource:    gvr.Resource,
+				Name:        name,
+				Subresource: app.Subresource,
+			},
+		},
+	}
+	response, err := tmpAuthClient.SelfSubjectAccessReviews().Create(context.TODO(), sar, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+	if response.Status.Allowed {
+		return nil
+	}
+	var errMsg = fmt.Sprintf("resource %v authorize failed.", gvr)
+	if len(response.Status.Reason) > 0 {
+		errMsg += fmt.Sprintf("reason: %v.", response.Status.Reason)
+	}
+	if len(response.Status.EvaluationError) > 0 {
+		errMsg += fmt.Sprintf("evaluation error: %v.", response.Status.EvaluationError)
+	}
+	return fmt.Errorf(errMsg)
+}
+
 // ProcessApplication processes application by re-translating it to kube-api request with kube client,
-// which will be processed and responced by apiserver eventually.
-// Specially if app.verb == watch, it transform app to a listener and register it to HandlerCenter, rather
-// then requetes to apiserver directly. Listener will then continuously listen kube-api change events and
+// which will be processed and responded by apiserver eventually.
+// Specially if app.verb == watch, it transforms app to a listener and register it to HandlerCenter, rather
+// than request to apiserver directly. Listener will then continuously listen kube-api change events and
 // push them to edge node.
 func (c *Center) ProcessApplication(app *Application) (interface{}, error) {
 	app.Status = InProcessing
-
 	gvr, ns, name := metaserver.ParseKey(app.Key)
+	var kubeClient dynamic.Interface
+	var err error
+	if app.Verb != Watch {
+		kubeClient, err = c.createKubeClient(app)
+		if err != nil {
+			klog.Errorf("create kube client error: %v", err)
+			return nil, err
+		}
+	}
 	switch app.Verb {
 	case List:
 		var option = new(metav1.ListOptions)
 		if err := app.OptionTo(option); err != nil {
 			return nil, err
 		}
-		if err := c.HandlerCenter.AddListener(app.ToListener(*option)); err != nil {
-			return nil, fmt.Errorf("failed to add listener, %v", err)
-		}
-		list, err := c.kubeclient.Resource(app.GVR()).Namespace(app.Namespace()).List(context.TODO(), *option)
+		list, err := kubeClient.Resource(gvr).Namespace(ns).List(context.TODO(), *option)
 		if err != nil {
-			return nil, fmt.Errorf("successfully to add listener but failed to get current list, %v", err)
+			return nil, fmt.Errorf("get current list error: %v", err)
 		}
 		return list, nil
 	case Watch:
+		err := c.authorizeApplication(app, gvr, ns, name)
+		if err != nil {
+			klog.Errorf("authorize application error: %v", err)
+			return nil, err
+		}
 		var option = new(metav1.ListOptions)
 		if err := app.OptionTo(option); err != nil {
 			return nil, err
@@ -428,7 +560,7 @@ func (c *Center) ProcessApplication(app *Application) (interface{}, error) {
 		if err := app.OptionTo(option); err != nil {
 			return nil, err
 		}
-		retObj, err := c.kubeclient.Resource(gvr).Namespace(ns).Get(context.TODO(), name, *option)
+		retObj, err := kubeClient.Resource(gvr).Namespace(ns).Get(context.TODO(), name, *option)
 		if err != nil {
 			return nil, err
 		}
@@ -442,7 +574,13 @@ func (c *Center) ProcessApplication(app *Application) (interface{}, error) {
 		if err := app.ReqBodyTo(obj); err != nil {
 			return nil, err
 		}
-		retObj, err := c.kubeclient.Resource(gvr).Namespace(ns).Create(context.TODO(), obj, *option)
+		var retObj interface{}
+		var err error
+		if app.Subresource == "" {
+			retObj, err = kubeClient.Resource(gvr).Namespace(ns).Create(context.TODO(), obj, *option)
+		} else {
+			retObj, err = kubeClient.Resource(gvr).Namespace(ns).Create(context.TODO(), obj, *option, app.Subresource)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -452,7 +590,7 @@ func (c *Center) ProcessApplication(app *Application) (interface{}, error) {
 		if err := app.OptionTo(&option); err != nil {
 			return nil, err
 		}
-		if err := c.kubeclient.Resource(gvr).Namespace(ns).Delete(context.TODO(), name, *option); err != nil {
+		if err := kubeClient.Resource(gvr).Namespace(ns).Delete(context.TODO(), name, *option); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -465,7 +603,13 @@ func (c *Center) ProcessApplication(app *Application) (interface{}, error) {
 		if err := app.ReqBodyTo(obj); err != nil {
 			return nil, err
 		}
-		retObj, err := c.kubeclient.Resource(gvr).Namespace(ns).Update(context.TODO(), obj, *option)
+		var retObj interface{}
+		var err error
+		if app.Subresource == "" {
+			retObj, err = kubeClient.Resource(gvr).Namespace(ns).Update(context.TODO(), obj, *option)
+		} else {
+			retObj, err = kubeClient.Resource(gvr).Namespace(ns).Update(context.TODO(), obj, *option, app.Subresource)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -479,7 +623,7 @@ func (c *Center) ProcessApplication(app *Application) (interface{}, error) {
 		if err := app.ReqBodyTo(obj); err != nil {
 			return nil, err
 		}
-		retObj, err := c.kubeclient.Resource(gvr).Namespace(ns).UpdateStatus(context.TODO(), obj, *option)
+		retObj, err := kubeClient.Resource(gvr).Namespace(ns).UpdateStatus(context.TODO(), obj, *option)
 		if err != nil {
 			return nil, err
 		}
@@ -489,7 +633,7 @@ func (c *Center) ProcessApplication(app *Application) (interface{}, error) {
 		if err := app.OptionTo(pi); err != nil {
 			return nil, err
 		}
-		retObj, err := c.kubeclient.Resource(gvr).Namespace(ns).Patch(context.TODO(), pi.Name, pi.PatchType, pi.Data, pi.Options, pi.Subresources...)
+		retObj, err := kubeClient.Resource(gvr).Namespace(ns).Patch(context.TODO(), pi.Name, pi.PatchType, pi.Data, pi.Options, pi.Subresources...)
 		if err != nil {
 			return nil, err
 		}
@@ -500,9 +644,20 @@ func (c *Center) ProcessApplication(app *Application) (interface{}, error) {
 }
 
 // Response update application, generate and send resp message to edge
-func (c *Center) Response(app *Application, parentID string, status applicationStatus, reason string, respContent interface{}) {
-	app.Status, app.Reason = status, reason
+func (c *Center) Response(app *Application, parentID string, status applicationStatus, err error, respContent interface{}) {
+	app.Status = status
+	if err != nil {
+		apierr, ok := err.(apierrors.APIStatus)
+		if ok {
+			app.Error = apierrors.StatusError{ErrStatus: apierr.Status()}
+		} else {
+			app.Reason = err.Error()
+		}
+	}
 	if respContent != nil {
+		if app.Verb == List || app.Verb == Get {
+			filter.MessageFilter(respContent, app.Nodename)
+		}
 		app.RespBody = toBytes(respContent)
 	}
 

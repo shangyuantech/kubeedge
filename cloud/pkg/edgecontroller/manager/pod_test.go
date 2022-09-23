@@ -17,7 +17,6 @@ limitations under the License.
 package manager
 
 import (
-	"io/ioutil"
 	"os"
 	"reflect"
 	"sync"
@@ -29,7 +28,6 @@ import (
 
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/client"
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/informers"
-	"github.com/kubeedge/kubeedge/cloud/pkg/edgecontroller/config"
 	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/cloudcore/v1alpha1"
 )
 
@@ -44,7 +42,7 @@ func TestPodManager_isPodUpdated(t *testing.T) {
 		want bool
 	}{
 		{
-			"TestPodManager_isPodUpdated(): Case 1: check differet pod",
+			"TestPodManager_isPodUpdated(): Case 1: check different pod",
 			args{
 				&CachePod{
 					ObjectMeta: TestOldPodObject.ObjectMeta,
@@ -184,8 +182,8 @@ func TestPodManager_merge(t *testing.T) {
 				pm.pods.Store(tt.fields.pods.GetUID(), tt.fields.pods)
 			}
 
-			go pm.merge()
 			tt.fields.realEvents <- tt.args.event
+			go pm.merge()
 		})
 	}
 }
@@ -229,16 +227,18 @@ func TestNewPodManager(t *testing.T) {
 		informer cache.SharedIndexInformer
 	}
 
-	config.Config.Buffer = &v1alpha1.EdgeControllerBuffer{
-		ConfigMapEvent: 1024,
+	config := &v1alpha1.EdgeController{
+		Buffer: &v1alpha1.EdgeControllerBuffer{
+			ConfigMapEvent: 1024,
+		},
 	}
 
-	tmpfile, err := ioutil.TempFile("", "kubeconfig")
+	tmpfile, err := os.CreateTemp("", "kubeconfig")
 	if err != nil {
 		t.Error(err)
 	}
 	defer os.Remove(tmpfile.Name())
-	if err := ioutil.WriteFile(tmpfile.Name(), []byte(mockKubeConfigContent), 0666); err != nil {
+	if err := os.WriteFile(tmpfile.Name(), []byte(mockKubeConfigContent), 0666); err != nil {
 		t.Error(err)
 	}
 	client.InitKubeEdgeClient(&v1alpha1.KubeAPIConfig{
@@ -261,7 +261,7 @@ func TestNewPodManager(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			NewPodManager(tt.args.informer)
+			NewPodManager(config, tt.args.informer)
 		})
 	}
 }

@@ -2,7 +2,6 @@ package utils
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
@@ -22,6 +21,19 @@ const (
 	DBFile                = "/tmp/edgecore/edgecore.db"
 )
 
+func CfgToFile(c *edgecore.EdgeCoreConfig) error {
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		fmt.Printf("Marshal edgecore config to yaml error %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(EdgeCoreConfigFile, data, os.ModePerm); err != nil {
+		fmt.Printf("Create edgecore config file %v error %v\n", EdgeCoreConfigFile, err)
+		os.Exit(1)
+	}
+	return nil
+}
+
 func CreateEdgeCoreConfigFile(nodeName string) error {
 	c := edgecore.NewDefaultEdgeCoreConfig()
 	c.Modules.Edged.HostnameOverride = nodeName
@@ -39,7 +51,7 @@ func CreateEdgeCoreConfigFile(nodeName string) error {
 		fmt.Printf("Marshal edgecore config to yaml error %v\n", err)
 		os.Exit(1)
 	}
-	if err := ioutil.WriteFile(EdgeCoreConfigFile, data, os.ModePerm); err != nil {
+	if err := os.WriteFile(EdgeCoreConfigFile, data, os.ModePerm); err != nil {
 		fmt.Printf("Create edgecore config file %v error %v\n", EdgeCoreConfigFile, err)
 		os.Exit(1)
 	}

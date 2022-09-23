@@ -56,7 +56,7 @@ func (ms *EdgedMetricsConnection) String() string {
 func (ms *EdgedMetricsConnection) Serve(tunnel SafeWriteTunneler) error {
 	//connect edged
 	client := http.Client{}
-	req, err := http.NewRequest("GET", ms.URL.String(), nil)
+	req, err := http.NewRequest(http.MethodGet, ms.URL.String(), nil)
 	if err != nil {
 		klog.Errorf("create new metrics request error %v", err)
 		return err
@@ -74,14 +74,15 @@ func (ms *EdgedMetricsConnection) Serve(tunnel SafeWriteTunneler) error {
 		return err
 	}
 	defer resp.Body.Close()
-	scan := bufio.NewScanner(resp.Body)
+
 	stop := make(chan struct{})
 
 	go func() {
+		defer close(stop)
+
 		for mess := range ms.ReadChan {
 			if mess.MessageType == MessageTypeRemoveConnect {
 				klog.Infof("receive remove client id %v", mess.ConnectID)
-				close(stop)
 				return
 			}
 		}
@@ -98,22 +99,24 @@ func (ms *EdgedMetricsConnection) Serve(tunnel SafeWriteTunneler) error {
 		}
 	}()
 
-	for scan.Scan() {
-		select {
-		case <-stop:
-			klog.Infof("receive stop single, so stop metrics scan ...")
-			return nil
-		default:
+	go func() {
+		defer close(ms.ReadChan)
+
+		scan := bufio.NewScanner(resp.Body)
+		for scan.Scan() {
+			// 10 = \n
+			msg := NewMessage(ms.MessID, MessageTypeData, append(scan.Bytes(), 10))
+			err := tunnel.WriteMessage(msg)
+			if err != nil {
+				klog.Errorf("write tunnel message %v error", msg)
+				return
+			}
+			klog.V(4).Infof("%v write metrics data %v", ms.String(), string(scan.Bytes()))
 		}
-		// 10 = \n
-		msg := NewMessage(ms.MessID, MessageTypeData, append(scan.Bytes(), 10))
-		err := tunnel.WriteMessage(msg)
-		if err != nil {
-			klog.Errorf("write tunnel message %v error", msg)
-			return err
-		}
-		klog.Infof("%v write metrics data %v", ms.String(), string(scan.Bytes()))
-	}
+	}()
+
+	<-stop
+	klog.Infof("receive stop signal, so stop metrics scan ...")
 	return nil
 }
 
