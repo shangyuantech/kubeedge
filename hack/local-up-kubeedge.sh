@@ -19,6 +19,7 @@ ENABLE_DAEMON=${ENABLE_DAEMON:-false}
 LOG_DIR=${LOG_DIR:-"/tmp"}
 LOG_LEVEL=${LOG_LEVEL:-2}
 TIMEOUT=${TIMEOUT:-60}s
+PROTOCOL=${PROTOCOL:-"WebSocket"}
 
 if [[ "${CLUSTER_NAME}x" == "x" ]];then
     CLUSTER_NAME="test"
@@ -104,6 +105,13 @@ function start_cloudcore {
   CLOUD_BIN=${KUBEEDGE_ROOT}/_output/local/bin/cloudcore
   ${CLOUD_BIN} --defaultconfig >  ${CLOUD_CONFIGFILE}
   sed -i '/cloudStream:/{n;s/false/true/;}' ${CLOUD_CONFIGFILE}
+  if [[ "${PROTOCOL}" = "QUIC" ]]; then
+    sed -i '/quic:/{n;N;s/false/true/;}' ${CLOUD_CONFIGFILE}
+  fi
+
+  # enable dynamic controller
+  sed -i '/dynamicController:/{n;s/false/true/;}' ${CLOUD_CONFIGFILE}
+
   sed -i -e "s|kubeConfig: .*|kubeConfig: ${KUBECONFIG}|g" \
     -e "s|/var/lib/kubeedge/|/tmp&|g" \
     -e "s|/etc/|/tmp/etc/|g" \
@@ -126,6 +134,13 @@ function start_edgecore {
   ${EDGE_BIN} --defaultconfig >  ${EDGE_CONFIGFILE}
 
   sed -i '/edgeStream:/{n;s/false/true/;}' ${EDGE_CONFIGFILE}
+  sed -i '/metaServer:/{n;s/false/true/;}' ${EDGE_CONFIGFILE}
+
+  if [[ "${PROTOCOL}" = "QUIC" ]]; then
+    sed -i '/quic:/{n;s/false/true/;}' ${EDGE_CONFIGFILE}
+    sed -i '/websocket:/{n;s/true/false/;}' ${EDGE_CONFIGFILE}
+  fi
+
   token=`kubectl get secret -nkubeedge tokensecret -o=jsonpath='{.data.tokendata}' | base64 -d`
 
   sed -i -e "s|token: .*|token: ${token}|g" \
@@ -134,6 +149,8 @@ function start_edgecore {
       -e "s|/var/lib/kubeedge/|/tmp&|g" \
       -e "s|mqttMode: .*|mqttMode: 0|g" \
       -e '/serviceBus:/{n;s/false/true/;}' ${EDGE_CONFIGFILE}
+
+  sed -i -e "s|/tmp/etc/resolv|/etc/resolv|g" ${EDGE_CONFIGFILE}
 
   EDGECORE_LOG=${LOG_DIR}/edgecore.log
 
@@ -253,7 +270,7 @@ if [[ "${ENABLE_DAEMON}" = false ]]; then
 else
     while true; do
         sleep 3
-        kubectl get nodes | grep edge-node | grep -q Ready && break
+        kubectl get nodes | grep edge-node | grep -q -w Ready && break
     done
     kubectl label node edge-node disktype=test
 fi

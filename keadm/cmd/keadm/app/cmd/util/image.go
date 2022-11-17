@@ -34,13 +34,18 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/cri/remote"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 
+	"github.com/kubeedge/kubeedge/common/constants"
 	"github.com/kubeedge/kubeedge/pkg/image"
 )
+
+// mqttLabel is used to select MQTT containers
+var mqttLabel = map[string]string{"io.kubeedge.edgecore/mqtt": image.EdgeMQTT}
 
 type ContainerRuntime interface {
 	PullImages(images []string) error
 	CopyResources(edgeImage string, files map[string]string) error
 	RunMQTT(mqttImage string) error
+	RemoveMQTT() error
 }
 
 func NewContainerRuntime(runtimeType string, endpoint string) (ContainerRuntime, error) {
@@ -142,6 +147,29 @@ func (runtime *DockerRuntime) RunMQTT(mqttImage string) error {
 	return runtime.Client.ContainerStart(runtime.ctx, container.ID, dockertypes.ContainerStartOptions{})
 }
 
+func (runtime *DockerRuntime) RemoveMQTT() error {
+	options := dockertypes.ContainerListOptions{
+		All: true,
+	}
+	options.Filters = filters.NewArgs()
+	options.Filters.Add("ancestor", constants.DefaultMosquittoImage)
+
+	mqttContainers, err := runtime.Client.ContainerList(runtime.ctx, options)
+	if err != nil {
+		fmt.Printf("List MQTT containers failed: %v\n", err)
+		return err
+	}
+
+	for _, c := range mqttContainers {
+		err = runtime.Client.ContainerRemove(runtime.ctx, c.ID, dockertypes.ContainerRemoveOptions{RemoveVolumes: true, Force: true})
+		if err != nil {
+			fmt.Printf("failed to remove MQTT container: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
 // CopyResources copies binary and configuration file from the image to the host.
 // dirs/files map: key is container file path, value is host file path
 // The command it executes are as follows:
@@ -239,7 +267,6 @@ func (runtime *CRIRuntime) CopyResources(edgeImage string, files map[string]stri
 		}
 	}()
 
-	copyCmd := copyResourcesCmd(files)
 	var mounts []*runtimeapi.Mount
 	for _, hostPath := range files {
 		mounts = append(mounts, &runtimeapi.Mount{
@@ -254,16 +281,19 @@ func (runtime *CRIRuntime) CopyResources(edgeImage string, files map[string]stri
 		Image: &runtimeapi.ImageSpec{
 			Image: edgeImage,
 		},
+		// Keep the container running by passing in a command that never ends.
+		// so that we can ExecSync in the following operations,
+		// to ensure that we can copy files from container to host totally and correctly
 		Command: []string{
 			"/bin/sh",
 			"-c",
-			copyCmd,
+			"sleep infinity",
 		},
 		Mounts: mounts,
 	}
 	containerID, err := runtime.RuntimeService.CreateContainer(sandbox, containerConfig, psc)
 	if err != nil {
-		return err
+		return fmt.Errorf("create container failed: %v", err)
 	}
 	defer func() {
 		if err := runtime.RuntimeService.RemoveContainer(containerID); err != nil {
@@ -271,7 +301,23 @@ func (runtime *CRIRuntime) CopyResources(edgeImage string, files map[string]stri
 		}
 	}()
 
-	return runtime.RuntimeService.StartContainer(containerID)
+	err = runtime.RuntimeService.StartContainer(containerID)
+	if err != nil {
+		return fmt.Errorf("start container failed: %v", err)
+	}
+
+	copyCmd := copyResourcesCmd(files)
+	cmd := []string{
+		"/bin/sh",
+		"-c",
+		copyCmd,
+	}
+	stdout, stderr, err := runtime.RuntimeService.ExecSync(containerID, cmd, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to exec copy cmd, err: %v, stderr: %s, stdout: %s", err, string(stderr), string(stdout))
+	}
+
+	return nil
 }
 
 func (runtime *CRIRuntime) RunMQTT(mqttImage string) error {
@@ -287,6 +333,7 @@ func (runtime *CRIRuntime) RunMQTT(mqttImage string) error {
 				HostPort:      9001,
 			},
 		},
+		Labels: mqttLabel,
 	}
 	sandbox, err := runtime.RuntimeService.RunPodSandbox(psc, "")
 	if err != nil {
@@ -310,6 +357,31 @@ func (runtime *CRIRuntime) RunMQTT(mqttImage string) error {
 		return err
 	}
 	return runtime.RuntimeService.StartContainer(containerID)
+}
+
+func (runtime *CRIRuntime) RemoveMQTT() error {
+	sandboxFilter := &runtimeapi.PodSandboxFilter{
+		LabelSelector: mqttLabel,
+	}
+
+	sandbox, err := runtime.RuntimeService.ListPodSandbox(sandboxFilter)
+	if err != nil {
+		fmt.Printf("List MQTT containers failed: %v\n", err)
+		return err
+	}
+
+	for _, c := range sandbox {
+		// by reference doc
+		// RemovePodSandbox removes the sandbox. If there are running containers in the
+		// sandbox, they should be forcibly removed.
+		// so we can remove mqtt containers totally.
+		err = runtime.RuntimeService.RemovePodSandbox(c.Id)
+		if err != nil {
+			fmt.Printf("failed to remove MQTT container: %v\n", err)
+		}
+	}
+
+	return nil
 }
 
 func copyResourcesCmd(files map[string]string) string {

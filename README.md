@@ -61,9 +61,9 @@ KubeEdge consists of cloud part and edge part.
 
 |                        | Kubernetes 1.16 | Kubernetes 1.17 | Kubernetes 1.18 | Kubernetes 1.19 | Kubernetes 1.20 | Kubernetes 1.21 | Kubernetes 1.22 |
 |------------------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|
-| KubeEdge 1.9           | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
 | KubeEdge 1.10          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
 | KubeEdge 1.11          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
+| KubeEdge 1.12          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
 | KubeEdge HEAD (master) | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
 
 Key:
@@ -114,6 +114,16 @@ developing the KubeEdge code, please see [CONTRIBUTING](./CONTRIBUTING.md) for
 details on submitting patches and the contribution workflow.
 
 ## Security
+
+### Security Audit
+
+A third party security audit of KubeEdge has been completed in July 2022. Additionally, the KubeEdge community completed an overall system security analysis of KubeEdge. The detailed reports are as follows.
+
+- [Security audit](https://github.com/kubeedge/community/blob/master/sig-security/sig-security-audit/KubeEdge-security-audit-2022.pdf)
+
+- [Threat model and security protection analysis paper](https://github.com/kubeedge/community/blob/master/sig-security/sig-security-audit/KubeEdge-threat-model-and-security-protection-analysis.md)
+
+### Reporting security vulnerabilities
 
 We encourage security researchers, industry organizations and users to proactively report suspected vulnerabilities to our security team (`cncf-kubeedge-security@lists.cncf.io`), the team will help diagnose the severity of the issue and determine how to address the issue as soon as possible.
 

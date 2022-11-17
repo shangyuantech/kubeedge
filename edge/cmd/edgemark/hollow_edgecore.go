@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -24,19 +25,36 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	cliflag "k8s.io/component-base/cli/flag"
-	internalapi "k8s.io/cri-api/pkg/apis"
+	"k8s.io/component-base/featuregate"
+	kubeletapp "k8s.io/kubernetes/cmd/kubelet/app"
+	kubeletoptions "k8s.io/kubernetes/cmd/kubelet/app/options"
+	"k8s.io/kubernetes/pkg/kubelet"
+	cadvisortest "k8s.io/kubernetes/pkg/kubelet/cadvisor/testing"
+	"k8s.io/kubernetes/pkg/kubelet/cm"
+	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
 	"k8s.io/kubernetes/pkg/kubelet/cri/remote"
 	fakeremote "k8s.io/kubernetes/pkg/kubelet/cri/remote/fake"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
+	"k8s.io/kubernetes/pkg/util/oom"
+	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/kubernetes/pkg/volume/configmap"
+	"k8s.io/kubernetes/pkg/volume/downwardapi"
+	"k8s.io/kubernetes/pkg/volume/emptydir"
+	"k8s.io/kubernetes/pkg/volume/hostpath"
+	"k8s.io/kubernetes/pkg/volume/local"
+	"k8s.io/kubernetes/pkg/volume/projected"
+	"k8s.io/kubernetes/pkg/volume/secret"
+	"k8s.io/kubernetes/pkg/volume/util/hostutil"
+	"k8s.io/kubernetes/pkg/volume/util/subpath"
+	"k8s.io/mount-utils"
 
 	"github.com/kubeedge/beehive/pkg/core"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/dbm"
 	"github.com/kubeedge/kubeedge/edge/pkg/edged"
 	"github.com/kubeedge/kubeedge/edge/pkg/edgehub"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager"
-	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha1"
-	"github.com/kubeedge/kubeedge/pkg/version/verflag"
+	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha2"
 )
 
 type hollowEdgeNodeConfig struct {
@@ -64,7 +82,6 @@ func newHollowEdgeNodeCommand() *cobra.Command {
 		Use:  "edgemark",
 		Long: "edgemark",
 		Run: func(cmd *cobra.Command, args []string) {
-			verflag.PrintAndExitIfRequested()
 			run(s)
 		},
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -87,8 +104,13 @@ func newHollowEdgeNodeCommand() *cobra.Command {
 func run(config *hollowEdgeNodeConfig) {
 	c := EdgeCoreConfig(config)
 
-	// use fake runtime service
-	edged.DefaultGetRuntimeService = GetFakeRuntimeAndImageServices
+	// use fake kubelet deps
+	edged.DefaultKubeletDeps = GetFakeKubeletDeps
+
+	edged.DefaultRunLiteKubelet = func(ctx context.Context, s *kubeletoptions.KubeletServer,
+		kubeDeps *kubelet.Dependencies, featureGate featuregate.FeatureGate) error {
+		return kubeletapp.RunKubelet(s, kubeDeps, false)
+	}
 
 	edged.Register(c.Modules.Edged)
 	edgehub.Register(c.Modules.EdgeHub, c.Modules.Edged.HostnameOverride)
@@ -109,8 +131,10 @@ func (c *hollowEdgeNodeConfig) addFlags(fs *pflag.FlagSet) {
 	fs.Var(&bindableNodeLabels, "node-labels", "Additional node labels")
 }
 
-func EdgeCoreConfig(config *hollowEdgeNodeConfig) *v1alpha1.EdgeCoreConfig {
-	edgeCoreConfig := v1alpha1.NewDefaultEdgeCoreConfig()
+func EdgeCoreConfig(config *hollowEdgeNodeConfig) *v1alpha2.EdgeCoreConfig {
+	edgeCoreConfig := v1alpha2.NewDefaultEdgeCoreConfig()
+
+	falseFlag := false
 
 	// overWrite config
 	edgeCoreConfig.DataBase.DataSource = "/edgecore.db"
@@ -118,36 +142,68 @@ func EdgeCoreConfig(config *hollowEdgeNodeConfig) *v1alpha1.EdgeCoreConfig {
 	edgeCoreConfig.Modules.EdgeHub.HTTPServer = config.HTTPServer
 	edgeCoreConfig.Modules.EdgeHub.WebSocket.Server = config.WebsocketServer
 
-	// use fake runtime for test
-	edgeCoreConfig.Modules.Edged.RuntimeType = "fake"
-	edgeCoreConfig.Modules.Edged.RemoteRuntimeEndpoint = "/run/fake/fake.sock"
-	edgeCoreConfig.Modules.Edged.RemoteImageEndpoint = "/run/fake/fake.sock"
-	edgeCoreConfig.Modules.Edged.EnableMetrics = false
-
 	edgeCoreConfig.Modules.Edged.HostnameOverride = config.NodeName
-	edgeCoreConfig.Modules.Edged.Labels = config.NodeLabels
+	edgeCoreConfig.Modules.Edged.NodeLabels = config.NodeLabels
+	edgeCoreConfig.Modules.Edged.RegisterNode = true
+	edgeCoreConfig.Modules.Edged.TailoredKubeletConfig.CgroupsPerQOS = &falseFlag
+	edgeCoreConfig.Modules.Edged.ContainerRuntime = kubetypes.RemoteContainerRuntime
+	edgeCoreConfig.Modules.Edged.TailoredKubeletConfig.EnableControllerAttachDetach = &falseFlag
+	edgeCoreConfig.Modules.Edged.TailoredKubeletConfig.ProtectKernelDefaults = false
 
 	return edgeCoreConfig
 }
 
-func GetFakeRuntimeAndImageServices(
-	remoteRuntimeEndpoint,
-	remoteImageEndpoint string,
-	runtimeRequestTimeout metav1.Duration) (internalapi.RuntimeService, internalapi.ImageManagerService, error) {
+func GetFakeKubeletDeps(
+	s *kubeletoptions.KubeletServer,
+	featureGate featuregate.FeatureGate) (*kubelet.Dependencies, error) {
 	endpoint, err := fakeremote.GenerateEndpoint()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate fake endpoint %v", err)
+		return nil, fmt.Errorf("failed to generate fake endpoint %v", err)
 	}
 
 	fakeRemoteRuntime := fakeremote.NewFakeRemoteRuntime()
 	if err = fakeRemoteRuntime.Start(endpoint); err != nil {
-		return nil, nil, fmt.Errorf("failed to start fake runtime %v", err)
+		return nil, fmt.Errorf("failed to start fake runtime %v", err)
 	}
 
 	runtimeService, err := remote.NewRemoteRuntimeService(endpoint, 15*time.Second)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to init runtime service %v", err)
+		return nil, fmt.Errorf("failed to init runtime service %v", err)
 	}
 
-	return runtimeService, fakeRemoteRuntime.ImageService, err
+	imageService := fakeRemoteRuntime.ImageService
+
+	cadvisorInterface := &cadvisortest.Fake{
+		NodeName: s.HostnameOverride,
+	}
+
+	containerManager := cm.NewStubContainerManager()
+
+	d := &kubelet.Dependencies{
+		RemoteRuntimeService: runtimeService,
+		RemoteImageService:   imageService,
+		CAdvisorInterface:    cadvisorInterface,
+		OSInterface:          &containertest.FakeOS{},
+		ContainerManager:     containerManager,
+		VolumePlugins:        volumePlugins(),
+		TLSOptions:           nil,
+		OOMAdjuster:          oom.NewFakeOOMAdjuster(),
+		Mounter:              &mount.FakeMounter{},
+		Subpather:            &subpath.FakeSubpath{},
+		HostUtil:             hostutil.NewFakeHostUtil(nil),
+	}
+
+	return d, nil
+}
+
+func volumePlugins() []volume.VolumePlugin {
+	allPlugins := []volume.VolumePlugin{}
+	allPlugins = append(allPlugins, emptydir.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, hostpath.ProbeVolumePlugins(volume.VolumeConfig{})...)
+	allPlugins = append(allPlugins, secret.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, downwardapi.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, configmap.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, projected.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, local.ProbeVolumePlugins()...)
+	return allPlugins
 }

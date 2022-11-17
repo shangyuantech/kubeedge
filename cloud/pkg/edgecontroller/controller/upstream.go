@@ -27,11 +27,11 @@ package controller
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -110,8 +110,6 @@ type UpstreamController struct {
 	secretChan                chan model.Message
 	serviceAccountTokenChan   chan model.Message
 	configMapChan             chan model.Message
-	serviceChan               chan model.Message
-	endpointsChan             chan model.Message
 	persistentVolumeChan      chan model.Message
 	persistentVolumeClaimChan chan model.Message
 	volumeAttachmentChan      chan model.Message
@@ -129,8 +127,6 @@ type UpstreamController struct {
 	podLister       corelisters.PodLister
 	configMapLister corelisters.ConfigMapLister
 	secretLister    corelisters.SecretLister
-	serviceLister   corelisters.ServiceLister
-	endpointLister  corelisters.EndpointsLister
 	nodeLister      corelisters.NodeLister
 	leaseLister     coordinationlisters.LeaseLister
 }
@@ -871,19 +867,13 @@ func (uc *UpstreamController) patchNode() {
 				continue
 			}
 
-			dataReq, ok := msg.Content.(string)
-			if !ok {
+			patchBytes, err := msg.GetContentData()
+			if err != nil {
 				klog.Warningf("message: %s process failure, get data failed with error: %v", msg.GetID(), err)
 				continue
 			}
 
-			nodeByte, err := base64.URLEncoding.DecodeString(dataReq)
-			if err != nil {
-				klog.Warningf("message: %s process failure, decode content data failed with error: %v", msg.GetID(), err)
-				continue
-			}
-
-			node, err := uc.kubeClient.CoreV1().Nodes().Patch(context.TODO(), name, apimachineryType.StrategicMergePatchType, nodeByte, metaV1.PatchOptions{}, "status")
+			node, err := uc.kubeClient.CoreV1().Nodes().Patch(context.TODO(), name, apimachineryType.StrategicMergePatchType, patchBytes, metaV1.PatchOptions{}, "status")
 			if err != nil {
 				klog.Errorf("message: %s process failure, patch node failed with error: %v, namespace: %s, name: %s", msg.GetID(), err, namespace, name)
 			}
@@ -1020,19 +1010,13 @@ func (uc *UpstreamController) patchPod() {
 				continue
 			}
 
-			dataReq, ok := msg.Content.(string)
-			if !ok {
+			patchBytes, err := msg.GetContentData()
+			if err != nil {
 				klog.Warningf("message: %s process failure, get data failed with error: %v", msg.GetID(), err)
 				continue
 			}
 
-			podByte, err := base64.URLEncoding.DecodeString(dataReq)
-			if err != nil {
-				klog.Warningf("message: %s process failure, decode content data failed with error: %v", msg.GetID(), err)
-				continue
-			}
-
-			updatedPod, err := uc.kubeClient.CoreV1().Pods(namespace).Patch(context.TODO(), name, apimachineryType.StrategicMergePatchType, podByte, metaV1.PatchOptions{}, "status")
+			updatedPod, err := uc.kubeClient.CoreV1().Pods(namespace).Patch(context.TODO(), name, apimachineryType.StrategicMergePatchType, patchBytes, metaV1.PatchOptions{}, "status")
 			if err != nil {
 				klog.Errorf("message: %s process failure, patch pod failed with error: %v, namespace: %s, name: %s", msg.GetID(), err, namespace, name)
 			}
@@ -1062,27 +1046,48 @@ func (uc *UpstreamController) deletePod() {
 
 			namespace, err := messagelayer.GetNamespace(msg)
 			if err != nil {
-				klog.Warningf("message: %s process failure, get namespace failed with error: %s", msg.GetID(), err)
+				klog.Warningf("message: %s process failure, get namespace failed with error: %v", msg.GetID(), err)
 				continue
 			}
 			name, err := messagelayer.GetResourceName(msg)
 			if err != nil {
-				klog.Warningf("message: %s process failure, get resource name failed with error: %s", msg.GetID(), err)
+				klog.Warningf("message: %s process failure, get resource name failed with error: %v", msg.GetID(), err)
 				continue
 			}
 
-			podUID, ok := msg.Content.(string)
-			if !ok {
-				klog.Warningf("Failed to get podUID from msg, pod namesapce: %s, pod name: %s", namespace, name)
-				continue
+			deleteOptions := metaV1.DeleteOptions{}
+			deleteReq, ok := msg.Content.(string)
+			if ok {
+				// in earlier version, deletion request content only contains pod UID.
+				var period int64
+				deleteOptions.GracePeriodSeconds = &period
+				// Use the pod UID as the precondition for deletion to prevent deleting a newly created pod with the same name and namespace.
+				deleteOptions.Preconditions = metaV1.NewUIDPreconditions(deleteReq)
+			} else {
+				data, err := msg.GetContentData()
+				if err != nil {
+					klog.Warningf("message: %s process failure, get msg content failed with error: %v", msg.GetID(), err)
+					continue
+				}
+
+				err = json.Unmarshal(data, &deleteOptions)
+				if err != nil {
+					klog.Warningf("Failed to unmarshal deletion options from msg, pod namespace: %s, pod name: %s, err: %v", namespace, name, err)
+					continue
+				}
 			}
 
-			deleteOptions := metaV1.NewDeleteOptions(0)
-			// Use the pod UID as the precondition for deletion to prevent deleting a newly created pod with the same name and namespace.
-			deleteOptions.Preconditions = metaV1.NewUIDPreconditions(podUID)
-			err = uc.kubeClient.CoreV1().Pods(namespace).Delete(context.Background(), name, *deleteOptions)
-			if err != nil {
+			err = uc.kubeClient.CoreV1().Pods(namespace).Delete(context.Background(), name, deleteOptions)
+			if err != nil && !errors.IsNotFound(err) && !strings.Contains(err.Error(), "The object might have been deleted and then recreated") {
 				klog.Warningf("Failed to delete pod, namespace: %s, name: %s, err: %v", namespace, name, err)
+				continue
+			}
+
+			resMsg := model.NewMessage(msg.GetID()).
+				FillBody(common.MessageSuccessfulContent).
+				BuildRouter(modules.EdgeControllerModuleName, constants.GroupResource, msg.GetResource(), model.ResponseOperation)
+			if err = uc.messageLayer.Response(*resMsg); err != nil {
+				klog.Errorf("Message: %s process failure, response failed with error: %v", msg.GetID(), err)
 				continue
 			}
 			klog.V(4).Infof("Successfully terminate and remove pod from etcd, namespace: %s, name: %s", namespace, name)
@@ -1157,7 +1162,7 @@ func (uc *UpstreamController) createOrUpdateLease() {
 			case model.UpdateOperation:
 				resp, err := uc.kubeClient.CoordinationV1().Leases(namespace).Update(context.TODO(), lease, metaV1.UpdateOptions{})
 				if err != nil {
-					klog.Error("Update lease %s failed, error: %v", name, err)
+					klog.Errorf("Update lease %s failed, error: %v", name, err)
 				}
 
 				resMsg := model.NewMessage(msg.GetID()).
@@ -1198,7 +1203,7 @@ func (uc *UpstreamController) queryLease() {
 
 			object, err := kubeClientGet(uc, namespace, name, model.ResourceTypeLease, msg)
 			if err != nil {
-				klog.Error("Query lease %s failed, error: %v", name, err)
+				klog.Errorf("Query lease %s failed, error: %v", name, err)
 			}
 
 			resMsg := model.NewMessage(msg.GetID()).
@@ -1344,8 +1349,6 @@ func NewUpstreamController(config *v1alpha1.EdgeController, factory k8sinformer.
 		config:       *config,
 	}
 	uc.nodeLister = factory.Core().V1().Nodes().Lister()
-	uc.endpointLister = factory.Core().V1().Endpoints().Lister()
-	uc.serviceLister = factory.Core().V1().Services().Lister()
 	uc.podLister = factory.Core().V1().Pods().Lister()
 	uc.configMapLister = factory.Core().V1().ConfigMaps().Lister()
 	uc.secretLister = factory.Core().V1().Secrets().Lister()
@@ -1356,8 +1359,6 @@ func NewUpstreamController(config *v1alpha1.EdgeController, factory k8sinformer.
 	uc.configMapChan = make(chan model.Message, config.Buffer.QueryConfigMap)
 	uc.secretChan = make(chan model.Message, config.Buffer.QuerySecret)
 	uc.serviceAccountTokenChan = make(chan model.Message, config.Buffer.ServiceAccountToken)
-	uc.serviceChan = make(chan model.Message, config.Buffer.QueryService)
-	uc.endpointsChan = make(chan model.Message, config.Buffer.QueryEndpoints)
 	uc.persistentVolumeChan = make(chan model.Message, config.Buffer.QueryPersistentVolume)
 	uc.persistentVolumeClaimChan = make(chan model.Message, config.Buffer.QueryPersistentVolumeClaim)
 	uc.volumeAttachmentChan = make(chan model.Message, config.Buffer.QueryVolumeAttachment)

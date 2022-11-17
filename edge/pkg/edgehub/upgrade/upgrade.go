@@ -112,20 +112,12 @@ func (*keadmUpgrade) Upgrade(upgradeReq *commontypes.NodeUpgradeJobRequest) erro
 
 	// install the requested installer keadm from docker image
 	klog.Infof("Begin to download version %s keadm", upgradeReq.Version)
-	container, err := util.NewContainerRuntime(config.Modules.Edged.RuntimeType, config.Modules.Edged.RemoteRuntimeEndpoint)
+	container, err := util.NewContainerRuntime(config.Modules.Edged.ContainerRuntime, config.Modules.Edged.RemoteRuntimeEndpoint)
 	if err != nil {
 		return fmt.Errorf("failed to new container runtime: %v", err)
 	}
 
-	var image string
-	imageTag := upgradeReq.Version
-	// if users specify Image, we'll use upgrade Version as its image tag
-	// if not, we'll use default image: kubeedge/installation-package:${Version}
-	if upgradeReq.Image != "" {
-		image = fmt.Sprintf("%s:%s", upgradeReq.Image, imageTag)
-	} else {
-		image = fmt.Sprintf("%s:%s", "kubeedge/installation-package", imageTag)
-	}
+	image := upgradeReq.Image
 
 	// TODO: do some verification 1.sha256(pass in using CRD) 2.image signature verification
 	// TODO: release verification mechanism
