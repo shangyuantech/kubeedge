@@ -29,7 +29,7 @@ import (
 	dockerclient "github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 	internalapi "k8s.io/cri-api/pkg/apis"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/kubelet/cri/remote"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
@@ -255,7 +255,10 @@ func (runtime *CRIRuntime) PullImages(images []string) error {
 // The same way as func (runtime *DockerRuntime) CopyResources
 func (runtime *CRIRuntime) CopyResources(edgeImage string, files map[string]string) error {
 	psc := &runtimeapi.PodSandboxConfig{
-		Metadata: &runtimeapi.PodSandboxMetadata{Name: KubeEdgeBinaryName},
+		Metadata: &runtimeapi.PodSandboxMetadata{
+			Name:      KubeEdgeBinaryName,
+			Namespace: constants.SystemNamespace,
+		},
 	}
 	sandbox, err := runtime.RuntimeService.RunPodSandbox(psc, "")
 	if err != nil {

@@ -85,7 +85,7 @@ func newDynamicController(enable bool) *DynamicController {
 	var dctl = &DynamicController{
 		enable:                       enable,
 		messageLayer:                 messagelayer.DynamicControllerMessageLayer(),
-		dynamicSharedInformerFactory: informers.GetInformersManager().GetDynamicSharedInformerFactory(),
+		dynamicSharedInformerFactory: informers.GetInformersManager().GetDynamicInformerFactory(),
 	}
 	dctl.applicationCenter = application.NewApplicationCenter(dctl.dynamicSharedInformerFactory)
 	dctl.applicationCenter.ForResource(v1.SchemeGroupVersion.WithResource("nodes"))
@@ -106,6 +106,8 @@ func (dctl *DynamicController) receiveMessage() {
 			klog.Warningf("Receive message failed, %s", err)
 			continue
 		}
+
+		klog.V(4).Infof("[DynamicController] receive, msg: %+v", msg)
 		dctl.applicationCenter.Process(msg)
 	}
 }

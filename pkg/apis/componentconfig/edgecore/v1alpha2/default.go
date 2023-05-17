@@ -24,9 +24,6 @@ import (
 	"strconv"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
-	configv1beta1 "k8s.io/kubernetes/pkg/kubelet/apis/config/v1beta1"
-	utilpointer "k8s.io/utils/pointer"
 
 	"github.com/kubeedge/kubeedge/common/constants"
 	metaconfig "github.com/kubeedge/kubeedge/pkg/apis/componentconfig/meta/v1alpha1"
@@ -38,17 +35,8 @@ func NewDefaultEdgeCoreConfig() *EdgeCoreConfig {
 	hostnameOverride := util.GetHostname()
 	localIP, _ := util.GetLocalIP(hostnameOverride)
 
-	in := kubeletconfigv1beta1.KubeletConfiguration{}
-	in.ContentType = "application/json"
-	in.ImageGCLowThresholdPercent = utilpointer.Int32Ptr(constants.DefaultImageGCLowThreshold)
-	in.ImageGCHighThresholdPercent = utilpointer.Int32Ptr(constants.DefaultImageGCHighThreshold)
-	in.ConfigMapAndSecretChangeDetectionStrategy = kubeletconfigv1beta1.GetChangeDetectionStrategy
-	in.FailSwapOn = utilpointer.BoolPtr(false)
-	in.EnableServer = utilpointer.BoolPtr(false)
-	in.Address = constants.ServerAddress
-	in.ReadOnlyPort = constants.ServerPort
-	in.ClusterDomain = constants.DefaultClusterDomain
-	configv1beta1.SetDefaults_KubeletConfiguration(&in)
+	defaultTailedKubeletConfig := TailoredKubeletConfiguration{}
+	SetDefaultsKubeletConfiguration(&defaultTailedKubeletConfig)
 
 	return &EdgeCoreConfig{
 		TypeMeta: metav1.TypeMeta{
@@ -63,14 +51,12 @@ func NewDefaultEdgeCoreConfig() *EdgeCoreConfig {
 		Modules: &Modules{
 			Edged: &Edged{
 				Enable:                true,
-				TailoredKubeletConfig: &in,
+				TailoredKubeletConfig: &defaultTailedKubeletConfig,
 				TailoredKubeletFlag: TailoredKubeletFlag{
-					KubeConfig:       constants.DefaultKubeletConfig,
 					HostnameOverride: hostnameOverride,
-					NodeIP:           "",
+					NodeIP:           localIP,
 					ContainerRuntimeOptions: ContainerRuntimeOptions{
 						ContainerRuntime:          constants.DefaultRuntimeType,
-						DockerEndpoint:            constants.DefaultDockerAddress,
 						PodSandboxImage:           constants.DefaultPodSandboxImage,
 						ImagePullProgressDeadline: metav1.Duration{Duration: constants.DefaultImagePullProgressDeadline},
 						CNIConfDir:                constants.DefaultCNIConfDir,
@@ -78,17 +64,18 @@ func NewDefaultEdgeCoreConfig() *EdgeCoreConfig {
 						CNICacheDir:               constants.DefaultCNICacheDir,
 						NetworkPluginMTU:          constants.DefaultNetworkPluginMTU,
 					},
-					RootDirectory:           "/var/lib/kubelet",
+					RootDirectory:           constants.DefaultRootDir,
 					MasterServiceNamespace:  metav1.NamespaceDefault,
 					RemoteRuntimeEndpoint:   constants.DefaultRemoteRuntimeEndpoint,
 					RemoteImageEndpoint:     constants.DefaultRemoteImageEndpoint,
+					MaxContainerCount:       -1,
 					MaxPerPodContainerCount: 1,
 					MinimumGCAge:            metav1.Duration{Duration: 0},
 					NonMasqueradeCIDR:       "10.0.0.0/8",
 					NodeLabels:              make(map[string]string),
 					RegisterNode:            true,
 					RegisterSchedulable:     true,
-					SeccompProfileRoot:      filepath.Join("/var/lib/kubelet", "seccomp"),
+					SeccompProfileRoot:      filepath.Join(constants.DefaultRootDir, "seccomp"),
 				},
 				CustomInterfaceName:   "",
 				RegisterNodeNamespace: constants.DefaultRegisterNodeNamespace,
@@ -186,17 +173,8 @@ func NewMinEdgeCoreConfig() *EdgeCoreConfig {
 	hostnameOverride := util.GetHostname()
 	localIP, _ := util.GetLocalIP(hostnameOverride)
 
-	in := kubeletconfigv1beta1.KubeletConfiguration{}
-	in.ContentType = "application/json"
-	in.ImageGCLowThresholdPercent = utilpointer.Int32Ptr(constants.DefaultImageGCLowThreshold)
-	in.ImageGCHighThresholdPercent = utilpointer.Int32Ptr(constants.DefaultImageGCHighThreshold)
-	in.ConfigMapAndSecretChangeDetectionStrategy = kubeletconfigv1beta1.GetChangeDetectionStrategy
-	in.FailSwapOn = utilpointer.BoolPtr(false)
-	in.EnableServer = utilpointer.BoolPtr(false)
-	in.Address = constants.ServerAddress
-	in.ReadOnlyPort = constants.ServerPort
-	in.ClusterDomain = constants.DefaultClusterDomain
-	configv1beta1.SetDefaults_KubeletConfiguration(&in)
+	defaultTailedKubeletConfig := TailoredKubeletConfiguration{}
+	SetDefaultsKubeletConfiguration(&defaultTailedKubeletConfig)
 
 	return &EdgeCoreConfig{
 		TypeMeta: metav1.TypeMeta{
@@ -209,14 +187,12 @@ func NewMinEdgeCoreConfig() *EdgeCoreConfig {
 		Modules: &Modules{
 			Edged: &Edged{
 				Enable:                true,
-				TailoredKubeletConfig: &in,
+				TailoredKubeletConfig: &defaultTailedKubeletConfig,
 				TailoredKubeletFlag: TailoredKubeletFlag{
-					KubeConfig:       constants.DefaultKubeletConfig,
 					HostnameOverride: hostnameOverride,
-					NodeIP:           "",
+					NodeIP:           localIP,
 					ContainerRuntimeOptions: ContainerRuntimeOptions{
 						ContainerRuntime:          constants.DefaultRuntimeType,
-						DockerEndpoint:            constants.DefaultDockerAddress,
 						PodSandboxImage:           constants.DefaultPodSandboxImage,
 						ImagePullProgressDeadline: metav1.Duration{Duration: constants.DefaultImagePullProgressDeadline},
 						CNIConfDir:                constants.DefaultCNIConfDir,
@@ -224,17 +200,18 @@ func NewMinEdgeCoreConfig() *EdgeCoreConfig {
 						CNICacheDir:               constants.DefaultCNICacheDir,
 						NetworkPluginMTU:          constants.DefaultNetworkPluginMTU,
 					},
-					RootDirectory:           "/var/lib/kubelet",
+					RootDirectory:           constants.DefaultRootDir,
 					MasterServiceNamespace:  metav1.NamespaceDefault,
 					RemoteRuntimeEndpoint:   constants.DefaultRemoteRuntimeEndpoint,
 					RemoteImageEndpoint:     constants.DefaultRemoteImageEndpoint,
+					MaxContainerCount:       -1,
 					MaxPerPodContainerCount: 1,
 					MinimumGCAge:            metav1.Duration{Duration: 0},
 					NonMasqueradeCIDR:       "10.0.0.0/8",
 					NodeLabels:              make(map[string]string),
 					RegisterNode:            true,
 					RegisterSchedulable:     true,
-					SeccompProfileRoot:      filepath.Join("/var/lib/kubelet", "seccomp"),
+					SeccompProfileRoot:      filepath.Join(constants.DefaultRootDir, "seccomp"),
 				},
 				CustomInterfaceName:   "",
 				RegisterNodeNamespace: constants.DefaultRegisterNodeNamespace,

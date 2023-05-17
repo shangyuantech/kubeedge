@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -41,7 +42,6 @@ import (
 	kubeletoptions "k8s.io/kubernetes/cmd/kubelet/app/options"
 	"k8s.io/kubernetes/pkg/kubelet"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
-	kubeletconfigv1beta1 "k8s.io/kubernetes/pkg/kubelet/apis/config/v1beta1"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	"k8s.io/kubernetes/pkg/kubelet/nodestatus"
 	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
@@ -141,17 +141,23 @@ func newEdged(enable bool, nodeName, namespace string) (*edged, error) {
 		}, nil
 	}
 
-	var kubeConfig kubeletconfig.KubeletConfiguration
-	var kubeFlags kubeletoptions.KubeletFlags
-	err = kubeletconfigv1beta1.Convert_v1beta1_KubeletConfiguration_To_config_KubeletConfiguration(edgedconfig.Config.TailoredKubeletConfig, &kubeConfig, nil)
+	var kubeletConfig kubeletconfig.KubeletConfiguration
+	var kubeletFlags kubeletoptions.KubeletFlags
+	err = edgedconfig.ConvertEdgedKubeletConfigurationToConfigKubeletConfiguration(edgedconfig.Config.TailoredKubeletConfig, &kubeletConfig, nil)
 	if err != nil {
 		klog.ErrorS(err, "Failed to convert kubelet config")
-		return nil, fmt.Errorf("failed to construct kubelet dependencies")
+		return nil, fmt.Errorf("failed to construct kubelet configuration")
 	}
-	edgedconfig.ConvertConfigEdgedFlagToConfigKubeletFlag(&edgedconfig.Config.TailoredKubeletFlag, &kubeFlags)
+	edgedconfig.ConvertConfigEdgedFlagToConfigKubeletFlag(&edgedconfig.Config.TailoredKubeletFlag, &kubeletFlags)
+	// Set Kubelet RegisterNode Parameter in KubeletConfiguration.
+	// The parameter `registerNode` has been migrated to Kubelet Configuration.
+	// `registerNode` in KubeletFlag will be retained for next version(1.13), and removed in 1.14 and later.
+	if !edgedconfig.Config.RegisterNode {
+		kubeletConfig.RegisterNode = false
+	}
 	kubeletServer := kubeletoptions.KubeletServer{
-		KubeletFlags:         kubeFlags,
-		KubeletConfiguration: kubeConfig,
+		KubeletFlags:         kubeletFlags,
+		KubeletConfiguration: kubeletConfig,
 	}
 	nodestatus.KubeletVersion = fmt.Sprintf("%s-kubeedge-%s", constants.CurrentSupportK8sVersion, version.Get())
 	// use kubeletServer to construct the default KubeletDeps
@@ -185,6 +191,8 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 	info := model.NewMessage("").BuildRouter(e.Name(), e.Group(), e.namespace+"/"+model.ResourceTypePod,
 		model.QueryOperation)
 	beehiveContext.Send(modules.MetaManagerModuleName, *info)
+	// rawUpdateChan receives the update events from metamanager or edgecontroller
+	rawUpdateChan := podCfg.Channel(kubelettypes.ApiserverSource)
 	for {
 		select {
 		case <-beehiveContext.Done():
@@ -214,21 +222,21 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 		switch resType {
 		case model.ResourceTypePod:
 			if op == model.ResponseOperation && resID == "" && result.GetSource() == modules.MetaManagerModuleName {
-				err := e.handlePodListFromMetaManager(content, podCfg)
+				err := e.handlePodListFromMetaManager(content, rawUpdateChan)
 				if err != nil {
 					klog.Errorf("handle podList failed: %v", err)
 					continue
 				}
 				podCfg.SetInitPodReady(true)
 			} else if op == model.ResponseOperation && resID == "" && result.GetSource() == metamanager.CloudControllerModel {
-				err := e.handlePodListFromEdgeController(content, podCfg)
+				err := e.handlePodListFromEdgeController(content, rawUpdateChan)
 				if err != nil {
 					klog.Errorf("handle podList failed: %v", err)
 					continue
 				}
 				podCfg.SetInitPodReady(true)
 			} else {
-				err = e.handlePod(op, content, podCfg)
+				err = e.handlePod(op, content, rawUpdateChan)
 				if err != nil {
 					klog.Errorf("handle pod failed: %v", err)
 					continue
@@ -259,11 +267,24 @@ func MakeKubeClientBridge(kubeletDeps *kubelet.Dependencies) {
 	kubeletDeps.HeartbeatClient = client
 }
 
-func (e *edged) handlePod(op string, content []byte, podCfg *config.PodConfig) (err error) {
+func (e *edged) handlePod(op string, content []byte, updatesChan chan<- interface{}) (err error) {
 	var pod v1.Pod
 	err = json.Unmarshal(content, &pod)
 	if err != nil {
 		return err
+	}
+
+	// When the edge node is offline and the pod in the node is deleted forcefully,
+	// and then we make the node online, We do not have the pod full information
+	// because the pod is deleted from the kube apiServer, then the syncController
+	// will send a message with the pod name, namespace and UID, so we can not filter
+	// pod according to the node name. So in this scenario, we query metadata from edge
+	// database and use func handlePodListFromMetaManager to sync with Kubelet.
+	if op == model.DeleteOperation && reflect.DeepEqual(pod.Spec, v1.PodSpec{}) {
+		info := model.NewMessage("").BuildRouter(e.Name(), e.Group(), e.namespace+"/"+model.ResourceTypePod,
+			model.QueryOperation)
+		beehiveContext.Send(modules.MetaManagerModuleName, *info)
+		return nil
 	}
 
 	var pods []*v1.Pod
@@ -272,21 +293,20 @@ func (e *edged) handlePod(op string, content []byte, podCfg *config.PodConfig) (
 	if filterPodByNodeName(&pod, e.nodeName) {
 		switch op {
 		case model.InsertOperation:
-			adds := &kubelettypes.PodUpdate{Op: kubelettypes.ADD, Pods: pods, Source: kubelettypes.ApiserverSource}
-			podCfg.EdgedCh <- *adds
+			klog.V(4).InfoS("Receive message of adding new pods", "pods", klog.KObjs(pods))
 		case model.UpdateOperation:
-			updates := &kubelettypes.PodUpdate{Op: kubelettypes.UPDATE, Pods: pods, Source: kubelettypes.ApiserverSource}
-			podCfg.EdgedCh <- *updates
+			klog.V(4).InfoS("Receive message of updating pods", "pods", klog.KObjs(pods))
 		case model.DeleteOperation:
-			deletes := &kubelettypes.PodUpdate{Op: kubelettypes.REMOVE, Pods: pods, Source: kubelettypes.ApiserverSource}
-			podCfg.EdgedCh <- *deletes
+			klog.V(4).InfoS("Receive message of deleting pods", "pods", klog.KObjs(pods))
 		}
+		updates := &kubelettypes.PodUpdate{Op: kubelettypes.UPDATE, Pods: pods, Source: kubelettypes.ApiserverSource}
+		updatesChan <- *updates
 	}
 
 	return nil
 }
 
-func (e *edged) handlePodListFromMetaManager(content []byte, podCfg *config.PodConfig) (err error) {
+func (e *edged) handlePodListFromMetaManager(content []byte, updatesChan chan<- interface{}) (err error) {
 	var lists []string
 	err = json.Unmarshal(content, &lists)
 	if err != nil {
@@ -313,16 +333,13 @@ func (e *edged) handlePodListFromMetaManager(content []byte, podCfg *config.PodC
 		}
 	}
 
-	adds := &kubelettypes.PodUpdate{Op: kubelettypes.ADD, Pods: pods, Source: kubelettypes.ApiserverSource}
-	podCfg.EdgedCh <- *adds
-
-	updates := &kubelettypes.PodUpdate{Op: kubelettypes.UPDATE, Pods: podsUpdate, Source: kubelettypes.ApiserverSource}
-	podCfg.EdgedCh <- *updates
+	updates := &kubelettypes.PodUpdate{Op: kubelettypes.SET, Pods: podsUpdate, Source: kubelettypes.ApiserverSource}
+	updatesChan <- *updates
 
 	return nil
 }
 
-func (e *edged) handlePodListFromEdgeController(content []byte, podCfg *config.PodConfig) (err error) {
+func (e *edged) handlePodListFromEdgeController(content []byte, updatesChan chan<- interface{}) (err error) {
 	var podLists []v1.Pod
 	var pods []*v1.Pod
 	if err := json.Unmarshal(content, &podLists); err != nil {
@@ -332,10 +349,10 @@ func (e *edged) handlePodListFromEdgeController(content []byte, podCfg *config.P
 	for _, pod := range podLists {
 		if filterPodByNodeName(&pod, e.nodeName) {
 			pods = append(pods, &pod)
-			adds := &kubelettypes.PodUpdate{Op: kubelettypes.ADD, Pods: pods, Source: kubelettypes.ApiserverSource}
-			podCfg.EdgedCh <- *adds
 		}
 	}
+	updates := &kubelettypes.PodUpdate{Op: kubelettypes.SET, Pods: pods, Source: kubelettypes.ApiserverSource}
+	updatesChan <- *updates
 
 	return nil
 }

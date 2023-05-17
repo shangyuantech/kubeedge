@@ -20,6 +20,7 @@ LOG_DIR=${LOG_DIR:-"/tmp"}
 LOG_LEVEL=${LOG_LEVEL:-2}
 TIMEOUT=${TIMEOUT:-60}s
 PROTOCOL=${PROTOCOL:-"WebSocket"}
+CONTAINER_RUNTIME=${CONTAINER_RUNTIME:-"remote"}
 
 if [[ "${CLUSTER_NAME}x" == "x" ]];then
     CLUSTER_NAME="test"
@@ -31,7 +32,16 @@ function check_prerequisites {
   kubeedge::golang::verify_golang_version
   check_kubectl
   check_kind
-  verify_docker_installed
+  if [[ "${CONTAINER_RUNTIME}" = "docker" ]]; then
+    # if we will use docker as edgecore container runtime, we need to verify whether docker already installed
+    verify_docker_installed
+  elif [[ "${CONTAINER_RUNTIME}" = "remote" ]]; then
+    # we will use containerd as cri runtime, so need to verify whether containerd already installed
+    verify_containerd_installed
+  else
+    echo "not supported container runtime ${CONTAINER_RUNTIME}"
+    exit 1
+  fi
 }
 
 # spin up cluster with kind command
@@ -114,6 +124,10 @@ function start_cloudcore {
 
   sed -i -e "s|kubeConfig: .*|kubeConfig: ${KUBECONFIG}|g" \
     -e "s|/var/lib/kubeedge/|/tmp&|g" \
+    -e "s|tlsCAFile: .*|tlsCAFile: /etc/kubeedge/ca/cloudhub/rootCA.crt|g" \
+    -e "s|tlsCAKeyFile: .*|tlsCAKeyFile: /etc/kubeedge/ca/cloudhub/rootCA.key|g" \
+    -e "s|tlsCertFile: .*|tlsCertFile: /etc/kubeedge/certs/cloudhub/server.crt|g" \
+    -e "s|tlsPrivateKeyFile: .*|tlsPrivateKeyFile: /etc/kubeedge/certs/cloudhub/server.key|g" \
     -e "s|/etc/|/tmp/etc/|g" \
     -e '/router:/{n;N;N;N;N;s/false/true/}' ${CLOUD_CONFIGFILE}
   CLOUDCORE_LOG=${LOG_DIR}/cloudcore.log
@@ -139,6 +153,14 @@ function start_edgecore {
   if [[ "${PROTOCOL}" = "QUIC" ]]; then
     sed -i '/quic:/{n;s/false/true/;}' ${EDGE_CONFIGFILE}
     sed -i '/websocket:/{n;s/true/false/;}' ${EDGE_CONFIGFILE}
+  fi
+
+  # if we will use docker as edgecore container runtime
+  # we need to change edgecore container runtime from default containerd to docker
+  if [[ "${CONTAINER_RUNTIME}" = "docker" ]]; then
+    sed -i 's|containerRuntime: .*|containerRuntime: docker|' ${EDGE_CONFIGFILE}
+    sed -i 's|remoteImageEndpoint: .*|remoteImageEndpoint: unix:///var/run/dockershim.sock|' ${EDGE_CONFIGFILE}
+    sed -i 's|remoteRuntimeEndpoint: .*|remoteRuntimeEndpoint: unix:///var/run/dockershim.sock|' ${EDGE_CONFIGFILE}
   fi
 
   token=`kubectl get secret -nkubeedge tokensecret -o=jsonpath='{.data.tokendata}' | base64 -d`
@@ -226,6 +248,12 @@ build_cloudcore
 build_edgecore
 
 kind_up_cluster
+
+# install CNI plugins
+if [[ "${CONTAINER_RUNTIME}" = "remote" ]]; then
+  # we need to install CNI plugins only when we use remote(containerd) as edgecore container runtime
+  install_cni_plugins
+fi
 
 export KUBECONFIG=$HOME/.kube/config
 

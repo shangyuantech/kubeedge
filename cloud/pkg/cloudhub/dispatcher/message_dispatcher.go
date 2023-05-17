@@ -169,7 +169,7 @@ func (md *messageDispatcher) DispatchUpstream(message *beehivemodel.Message, inf
 	case common.IsVolumeResource(message.GetResource()):
 		beehivecontext.SendResp(*message)
 
-	case message.Router.Operation == beehivemodel.ResponseOperation:
+	case message.GetOperation() == beehivemodel.ResponseOperation:
 		err := md.SessionManager.ReceiveMessageAck(info.NodeID, message.Header.ParentID)
 		if err != nil {
 			klog.Errorf("node %s receive message ack err: %v", info.NodeID, err)
@@ -373,6 +373,11 @@ func noAckRequired(msg *beehivemodel.Message) bool {
 	case msg.GetOperation() == beehivemodel.ResponseOperation:
 		content, ok := msg.Content.(string)
 		if ok && content == commonconst.MessageSuccessfulContent {
+			return true
+		}
+		// `error message` is not required to ack
+		_, ok = msg.Content.(error)
+		if ok {
 			return true
 		}
 		fallthrough

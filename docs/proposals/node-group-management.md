@@ -57,7 +57,7 @@ However, with the number of locations increasing, operation and maintenance of a
 ### Architecture
 ![image](../images/node-group-management/group-management-arch.png)
 
-The implementation consists of two components. a new `GroupManagementControllerManager` and the endpointslice filter in the `cloudcore`. The `GroupManagementControllerManager` contains controllers of new CRDs, including `NodeGroupController` and `EdgeApplicationController`. The endpointslice filter is used to filter endpoints in endpointslices before sending them to the edgecore so as to make edgecore only aware of the endpoints in the same node group.
+The implementation consists of two components. a new `GroupManagementControllerManager` and the endpointslice filter in the `cloudcore`. The `GroupManagementControllerManager` contains controllers of new CRDs, including `NodeGroupController` and `EdgeApplicationController`. The endpointslice filter is used to filter endpoints in endpointslices before sending them to the edgecore to make edgecore only aware of the endpoints in the same node group.
 
 NodeGroup will organize nodes according to their labels which should be set based on their locations in advance, `location: hangzhou` and `location: beijing` in this case. After applying the NodeGroup resource, nodes will be grouped in `hangzhou` and `beijing` logically.
 
@@ -135,8 +135,8 @@ type EdgeApplication struct {
 type EdgeAppSpec struct {
 	// WorkloadTemplate represents original templates of manifested resources to be deployed in node groups.
 	WorkloadTemplate ResourceTemplate `json:"workloadTemplate,omitempty"`
-	// WorkloadScopes represents which node groups the workload will be deployed in.
-	WorkloadScopes WorkloadScope `json:"workloadScopes"`
+	// WorkloadScope represents which node groups the workload will be deployed in.
+	WorkloadScope WorkloadScope `json:"workloadScope"`
 }
 
 // WorkloadScope represents which node groups the workload to be deployed in.
@@ -167,9 +167,9 @@ type Overriders struct {
 	// Replicas will override the replicas field of deployment
 	// +optional
 	Replicas int `json:"replicas,omitempty"`
-	// ImageOverrider represents the rules dedicated to handling image overrides.
+	// ImageOverriders represents the rules dedicated to handling image overrides.
 	// +optional
-	ImageOverrider []ImageOverrider `json:"imageOverrider,omitempty"`
+	ImageOverrider []ImageOverrider `json:"imageOverriders,omitempty"`
 }
 
 // ImageOverrider represents the rules dedicated to handling image overrides.
@@ -341,49 +341,49 @@ spec:
   workloadTemplate:
     manifests:
     - apiVersion: apps/v1
-    kind: Deployment
-    metadata:
-      name: nginx
-    spec:
-      selector:
-        matchLabels:
-          app: nginx
-      template:
-        metadata:
-          labels:
+      kind: Deployment
+      metadata:
+        name: nginx
+      spec:
+        selector:
+          matchLabels:
             app: nginx
-        spec:
-          containers:
-          - name: nginx
-            image: nginx:latest
-          ports:
-          - containerPort: 80
+        template:
+          metadata:
+            labels:
+              app: nginx
+          spec:
+            containers:
+            - name: nginx
+              image: nginx:latest
+            ports:
+            - containerPort: 80
     - apiVersion: v1
-    kind: Service
-    metadata:
-      name: nginx-service
-    spec:
-      selector:
-        app: nginx
-      ports:
-      - name: http
-        protocol: TCP
-        port: 80
-        targetPort: 8080
-      type: LoadBalancer
-  workloadScopes:
+      kind: Service
+      metadata:
+        name: nginx-service
+      spec:
+        selector:
+          app: nginx
+        ports:
+        - name: http
+          protocol: TCP
+          port: 80
+          targetPort: 8080
+        type: LoadBalancer
+  workloadScope:
     targetNodeGroups:
       - name: hangzhou
         overriders:
           replicas: 2
-          imageOverrider:
+          imageOverriders:
             - component: "registry"
               operator: "replace"
               value: "hangzhou.registry.io"
       - name: beijing
         overriders:
           replicas: 3
-          imageOverrider:
+          imageOverriders:
             - component: "registry"
               operator: "replace"
               value: "beijing.registry.io"

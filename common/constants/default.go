@@ -18,6 +18,8 @@ const (
 
 	SystemName      = "kubeedge"
 	SystemNamespace = SystemName
+
+	CloudConfigMapName = "cloudcore"
 )
 
 // Resources
@@ -41,15 +43,21 @@ const (
 	DefaultMqttCertFile = "/etc/kubeedge/certs/server.crt"
 	DefaultMqttKeyFile  = "/etc/kubeedge/certs/server.key"
 
+	// Bootstrap file, contains token used by edgecore to apply for ca/cert
+	BootstrapFile = "/etc/kubeedge/bootstrap-edgecore.conf"
+
 	// Edged
-	DefaultKubeletConfig               = "/etc/kubeedge/config/kubeconfig"
-	DefaultDockerAddress               = "unix:///var/run/docker.sock"
-	DefaultRuntimeType                 = "docker"
-	DefaultEdgedMemoryCapacity         = 7852396000
-	DefaultRemoteRuntimeEndpoint       = "unix:///var/run/dockershim.sock"
-	DefaultRemoteImageEndpoint         = "unix:///var/run/dockershim.sock"
-	DefaultMosquittoImage              = "eclipse-mosquitto:1.6.15"
-	DefaultPodSandboxImage             = "kubeedge/pause:3.1"
+	DefaultRootDir               = "/var/lib/edged"
+	DefaultDockerAddress         = "unix:///var/run/docker.sock"
+	DefaultRuntimeType           = "remote"
+	DefaultDockershimRootDir     = "/var/lib/dockershim"
+	DefaultEdgedMemoryCapacity   = 7852396000
+	DefaultRemoteRuntimeEndpoint = "unix:///run/containerd/containerd.sock"
+	DefaultRemoteImageEndpoint   = "unix:///run/containerd/containerd.sock"
+	DefaultMosquittoImage        = "eclipse-mosquitto:1.6.15"
+	// update PodSandboxImage version when bumping k8s vendor version, consistent with vendor/k8s.io/kubernetes/cmd/kubelet/app/options/container_runtime.go defaultPodSandboxImageVersion
+	// When this value are updated, also update comments in pkg/apis/componentconfig/edgecore/v1alpha1/types.go
+	DefaultPodSandboxImage             = "kubeedge/pause:3.6"
 	DefaultImagePullProgressDeadline   = time.Minute
 	DefaultImageGCHighThreshold        = 80
 	DefaultImageGCLowThreshold         = 40
@@ -66,7 +74,7 @@ const (
 	DefaultTunnelPort                  = 10004
 	DefaultClusterDomain               = "cluster.local"
 
-	CurrentSupportK8sVersion = "v1.22.6"
+	CurrentSupportK8sVersion = "v1.23.15"
 
 	// MetaManager
 	DefaultRemoteQueryTimeout = 60
@@ -77,26 +85,24 @@ const (
 	DefaultKubeNamespace           = v1.NamespaceAll
 	DefaultKubeQPS                 = 100.0
 	DefaultKubeBurst               = 200
+	DefaultNodeLimit               = 500
 	DefaultKubeUpdateNodeFrequency = 20
 
 	// EdgeController
 	DefaultUpdatePodStatusWorkers            = 1
 	DefaultUpdateNodeStatusWorkers           = 1
-	DefaultQueryConfigMapWorkers             = 4
-	DefaultQuerySecretWorkers                = 4
+	DefaultQueryConfigMapWorkers             = 100
+	DefaultQuerySecretWorkers                = 100
 	DefaultQueryPersistentVolumeWorkers      = 4
 	DefaultQueryPersistentVolumeClaimWorkers = 4
 	DefaultQueryVolumeAttachmentWorkers      = 4
-	DefaultCreateNodeWorkers                 = 4
-	DefaultPatchNodeWorkers                  = 4
-	DefaultQueryNodeWorkers                  = 4
+	DefaultCreateNodeWorkers                 = 100
 	DefaultUpdateNodeWorkers                 = 4
-	DefaultPatchPodWorkers                   = 4
-	DefaultDeletePodWorkers                  = 4
+	DefaultPatchPodWorkers                   = 100
+	DefaultDeletePodWorkers                  = 100
 	DefaultUpdateRuleStatusWorkers           = 4
-	DefaultCreateLeaseWorkers                = 4
-	DefaultQueryLeaseWorkers                 = 4
-	DefaultServiceAccountTokenWorkers        = 4
+	DefaultQueryLeaseWorkers                 = 100
+	DefaultServiceAccountTokenWorkers        = 100
 
 	DefaultUpdatePodStatusBuffer            = 1024
 	DefaultUpdateNodeStatusBuffer           = 1024
@@ -106,12 +112,9 @@ const (
 	DefaultQueryPersistentVolumeClaimBuffer = 1024
 	DefaultQueryVolumeAttachmentBuffer      = 1024
 	DefaultCreateNodeBuffer                 = 1024
-	DefaultPatchNodeBuffer                  = 1024
-	DefaultQueryNodeBuffer                  = 1024
 	DefaultUpdateNodeBuffer                 = 1024
 	DefaultPatchPodBuffer                   = 1024
 	DefaultDeletePodBuffer                  = 1024
-	DefaultCreateLeaseBuffer                = 1024
 	DefaultQueryLeaseBuffer                 = 1024
 	DefaultServiceAccountTokenBuffer        = 1024
 

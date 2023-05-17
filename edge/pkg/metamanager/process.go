@@ -15,25 +15,18 @@ import (
 	cloudmodules "github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
 	"github.com/kubeedge/kubeedge/common/constants"
 	connect "github.com/kubeedge/kubeedge/edge/pkg/common/cloudconnection"
-	messagepkg "github.com/kubeedge/kubeedge/edge/pkg/common/message"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	metaManagerConfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/config"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator"
 )
 
-//Constants to check metamanager processes
+// Constants to check metamanager processes
 const (
 	OK = "OK"
 
 	GroupResource = "resource"
 
-	OperationFunctionAction = "action"
-
-	OperationFunctionActionResult = "action_result"
-
-	EdgeFunctionModel    = "edgefunction"
-	CloudFunctionModel   = "funcmgr"
 	CloudControllerModel = "edgecontroller"
 )
 
@@ -48,6 +41,13 @@ func feedbackError(err error, info string, request model.Message) {
 	} else {
 		sendToCloud(errResponse)
 	}
+}
+
+func feedbackResponse(message *model.Message, parentID string, resp *model.Message) {
+	resp.BuildHeader(resp.GetID(), parentID, resp.GetTimestamp())
+	sendToEdged(resp, message.IsSync())
+	respToCloud := message.NewRespByMessage(resp, OK)
+	sendToCloud(respToCloud)
 }
 
 func sendToEdged(message *model.Message, sync bool) {
@@ -89,10 +89,6 @@ func requireRemoteQuery(resType string) bool {
 		resType == model.ResourceTypeNode ||
 		resType == model.ResourceTypeServiceAccountToken ||
 		resType == model.ResourceTypeLease
-}
-
-func isConnected() bool {
-	return metaManagerConfig.Connected
 }
 
 func msgDebugInfo(message *model.Message) string {
@@ -176,10 +172,6 @@ func (m *metaManager) processUpdate(message model.Message) {
 		sendToEdged(&message, message.IsSync())
 		resp := message.NewRespByMessage(&message, OK)
 		sendToCloud(resp)
-	case CloudFunctionModel:
-		beehiveContext.Send(EdgeFunctionModel, message)
-	case EdgeFunctionModel:
-		sendToCloud(&message)
 	case cloudmodules.DeviceControllerModuleName:
 		resp := message.NewRespByMessage(&message, OK)
 		sendToCloud(resp)
@@ -376,7 +368,7 @@ func (m *metaManager) processQuery(message model.Message) {
 	resKey, resType, resID := parseResource(message.GetResource())
 	var metas *[]string
 	var err error
-	if requireRemoteQuery(resType) && isConnected() {
+	if requireRemoteQuery(resType) && connect.IsConnected() {
 		resKey, err = getSpecialResourceKey(resType, resKey, message)
 		if err != nil {
 			klog.Errorf("failed to get special resource %s key", resKey)
@@ -423,7 +415,12 @@ func (m *metaManager) processRemoteQuery(message model.Message) {
 			feedbackError(err, "Error to query meta in DB", message)
 			return
 		}
-
+		errContent, ok := resp.GetContent().(error)
+		if ok {
+			klog.V(4).Infof("process remote query err: %v", errContent)
+			feedbackResponse(&message, originalID, &resp)
+			return
+		}
 		klog.V(4).Infof("process remote query: req[%s], resp[%s]", msgDebugInfo(&message), msgDebugInfo(&resp))
 		content, err := resp.GetContentData()
 		if err != nil {
@@ -447,69 +444,8 @@ func (m *metaManager) processRemoteQuery(message model.Message) {
 		if err != nil {
 			klog.Errorf("update meta failed, %s", msgDebugInfo(&resp))
 		}
-		resp.BuildHeader(resp.GetID(), originalID, resp.GetTimestamp())
-
-		sendToEdged(&resp, message.IsSync())
-
-		respToCloud := message.NewRespByMessage(&resp, OK)
-		sendToCloud(respToCloud)
+		feedbackResponse(&message, originalID, &resp)
 	}()
-}
-
-func (m *metaManager) processNodeConnection(message model.Message) {
-	content, _ := message.GetContent().(string)
-	klog.Infof("node connection event occur: %s", content)
-	if content == connect.CloudConnected {
-		metaManagerConfig.Connected = true
-	} else if content == connect.CloudDisconnected {
-		metaManagerConfig.Connected = false
-	}
-}
-
-func (m *metaManager) processFunctionAction(message model.Message) {
-	content, err := message.GetContentData()
-	if err != nil {
-		klog.Errorf("get action message content data failed, %s: %v", msgDebugInfo(&message), err)
-		feedbackError(err, "Error to get action message content data", message)
-		return
-	}
-
-	resKey, resType, _ := parseResource(message.GetResource())
-	meta := &dao.Meta{
-		Key:   resKey,
-		Type:  resType,
-		Value: string(content)}
-	err = dao.SaveMeta(meta)
-	if err != nil {
-		klog.Errorf("save meta failed, %s: %v", msgDebugInfo(&message), err)
-		feedbackError(err, "Error to save meta to DB", message)
-		return
-	}
-
-	beehiveContext.Send(EdgeFunctionModel, message)
-}
-
-func (m *metaManager) processFunctionActionResult(message model.Message) {
-	content, err := message.GetContentData()
-	if err != nil {
-		klog.Errorf("get action_result message content data failed, %s: %v", msgDebugInfo(&message), err)
-		feedbackError(err, "Error to get action_result message content data", message)
-		return
-	}
-
-	resKey, resType, _ := parseResource(message.GetResource())
-	meta := &dao.Meta{
-		Key:   resKey,
-		Type:  resType,
-		Value: string(content)}
-	err = dao.SaveMeta(meta)
-	if err != nil {
-		klog.Errorf("save meta failed, %s: %v", msgDebugInfo(&message), err)
-		feedbackError(err, "Error to save meta to DB", message)
-		return
-	}
-
-	sendToCloud(&message)
 }
 
 func (m *metaManager) processVolume(message model.Message) {
@@ -541,12 +477,6 @@ func (m *metaManager) process(message model.Message) {
 		m.processQuery(message)
 	case model.ResponseOperation:
 		m.processResponse(message)
-	case messagepkg.OperationNodeConnection:
-		m.processNodeConnection(message)
-	case OperationFunctionAction:
-		m.processFunctionAction(message)
-	case OperationFunctionActionResult:
-		m.processFunctionActionResult(message)
 	case constants.CSIOperationTypeCreateVolume,
 		constants.CSIOperationTypeDeleteVolume,
 		constants.CSIOperationTypeControllerPublishVolume,

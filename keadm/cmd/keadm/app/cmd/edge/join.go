@@ -24,8 +24,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/blang/semver"
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"sigs.k8s.io/yaml"
@@ -33,6 +36,8 @@ import (
 	"github.com/kubeedge/kubeedge/common/constants"
 	"github.com/kubeedge/kubeedge/keadm/cmd/keadm/app/cmd/common"
 	"github.com/kubeedge/kubeedge/keadm/cmd/keadm/app/cmd/util"
+	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha1"
+	validationv1alpha1 "github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha1/validation"
 	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha2"
 	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha2/validation"
 	pkgutil "github.com/kubeedge/kubeedge/pkg/util"
@@ -54,6 +59,8 @@ keadm join --cloudcore-ipport=<ip:port address> --edgenode-name=<unique string a
 keadm join --cloudcore-ipport=10.20.30.40:10000 --edgenode-name=testing123 --kubeedge-version=v` + common.DefaultKubeEdgeVersion + `
 `
 )
+
+var edgeCoreConfig *v1alpha2.EdgeCoreConfig
 
 func NewEdgeJoin() *cobra.Command {
 	joinOptions := newOption()
@@ -131,10 +138,10 @@ func AddJoinOtherFlags(cmd *cobra.Command, joinOptions *common.JoinOptions) {
 		"Container runtime type")
 
 	cmd.Flags().StringVarP(&joinOptions.EdgeNodeName, common.EdgeNodeName, "i", joinOptions.EdgeNodeName,
-		"KubeEdge Node unique identification string, If flag not used then the command will generate a unique id on its own")
+		"KubeEdge Node unique identification string, if flag not used then the command will generate a unique id on its own")
 
 	cmd.Flags().StringVarP(&joinOptions.RemoteRuntimeEndpoint, common.RemoteRuntimeEndpoint, "p", joinOptions.RemoteRuntimeEndpoint,
-		"KubeEdge Edge Node RemoteRuntimeEndpoint string, If flag not set, it will use unix:///var/run/dockershim.sock")
+		"KubeEdge Edge Node RemoteRuntimeEndpoint string, if flag not set, it will use unix:///run/containerd/containerd.sock")
 
 	cmd.Flags().StringVarP(&joinOptions.Token, common.Token, "t", joinOptions.Token,
 		"Used for edge to apply for the certificate")
@@ -146,13 +153,13 @@ func AddJoinOtherFlags(cmd *cobra.Command, joinOptions *common.JoinOptions) {
 		"Use this key to set the temp directory path for KubeEdge tarball, if not exist, download it")
 
 	cmd.Flags().StringSliceVarP(&joinOptions.Labels, common.Labels, "l", joinOptions.Labels,
-		`use this key to set the customized labels for node. you can input customized labels like key1=value1,key2=value2`)
+		`Use this key to set the customized labels for node, you can input customized labels like key1=value1,key2=value2`)
 
 	cmd.Flags().BoolVar(&joinOptions.WithMQTT, "with-mqtt", joinOptions.WithMQTT,
-		`use this key to set whether to install and start MQTT Broker by default`)
+		`Use this key to set whether to install and start MQTT Broker by default`)
 
 	cmd.Flags().StringVar(&joinOptions.ImageRepository, common.ImageRepository, joinOptions.ImageRepository,
-		`Use this key to decide which image repository to pull images from.`,
+		`Use this key to decide which image repository to pull images from`,
 	)
 }
 
@@ -161,7 +168,8 @@ func newOption() *common.JoinOptions {
 	joinOptions.WithMQTT = true
 	joinOptions.CGroupDriver = v1alpha2.CGroupDriverCGroupFS
 	joinOptions.CertPath = common.DefaultCertPath
-	joinOptions.RuntimeType = kubetypes.DockerContainerRuntime
+	joinOptions.RuntimeType = kubetypes.RemoteContainerRuntime
+	joinOptions.RemoteRuntimeEndpoint = constants.DefaultRemoteRuntimeEndpoint
 	return joinOptions
 }
 
@@ -182,13 +190,37 @@ func join(opt *common.JoinOptions, step *common.Step) error {
 		return fmt.Errorf("create systemd service file failed: %v", err)
 	}
 
+	// write token to bootstrap configure file
+	if err := createBootstrapFile(opt); err != nil {
+		return fmt.Errorf("create bootstrap file failed: %v", err)
+	}
+	// Delete the bootstrap file, so the credential used for TLS bootstrap is removed from disk
+	defer os.Remove(filepath.Join(util.KubeEdgePath, "bootstrap-edgecore.conf"))
+
 	step.Printf("Generate EdgeCore default configuration")
 	if err := createEdgeConfigFiles(opt); err != nil {
 		return fmt.Errorf("create edge config file failed: %v", err)
 	}
 
 	step.Printf("Run EdgeCore daemon")
-	return runEdgeCore()
+	err := runEdgeCore()
+	if err != nil {
+		return fmt.Errorf("start edgecore failed: %v", err)
+	}
+
+	// wait for edgecore start successfully using specified token
+	// if edgecore start, it will get ca/certs from cloud
+	// if ca/certs generated, we can remove bootstrap file
+	err = wait.Poll(10*time.Second, 300*time.Second, func() (bool, error) {
+		if util.FileExists(edgeCoreConfig.Modules.EdgeHub.TLSCAFile) &&
+			util.FileExists(edgeCoreConfig.Modules.EdgeHub.TLSCertFile) &&
+			util.FileExists(edgeCoreConfig.Modules.EdgeHub.TLSPrivateKeyFile) {
+			return true, nil
+		}
+		return false, nil
+	})
+
+	return err
 }
 
 func createDirs() error {
@@ -212,10 +244,18 @@ func createDirs() error {
 }
 
 func createEdgeConfigFiles(opt *common.JoinOptions) error {
-	var edgeCoreConfig *v1alpha2.EdgeCoreConfig
+	// Determines whether the kubeEdgeVersion is earlier than v1.12.0
+	// If so, we need to create edgeconfig with v1alpha1 version
+	v, err := semver.ParseTolerant(opt.KubeEdgeVersion)
+	if err != nil {
+		return fmt.Errorf("parse kubeedge version failed, %v", err)
+	}
+	if v.Major <= 1 && v.Minor < 12 {
+		return createV1alpha1EdgeConfigFiles(opt)
+	}
 
 	configFilePath := filepath.Join(util.KubeEdgePath, "config/edgecore.yaml")
-	_, err := os.Stat(configFilePath)
+	_, err = os.Stat(configFilePath)
 	if err == nil || os.IsExist(err) {
 		klog.Infoln("Read existing configuration file")
 		b, err := os.ReadFile(configFilePath)
@@ -232,6 +272,9 @@ func createEdgeConfigFiles(opt *common.JoinOptions) error {
 	}
 
 	edgeCoreConfig.Modules.EdgeHub.WebSocket.Server = opt.CloudCoreIPPort
+	// TODO: remove this after release 1.14
+	// this is for keeping backward compatibility
+	// don't save token in configuration edgecore.yaml
 	if opt.Token != "" {
 		edgeCoreConfig.Modules.EdgeHub.Token = opt.Token
 	}
@@ -269,26 +312,97 @@ func createEdgeConfigFiles(opt *common.JoinOptions) error {
 	edgeCoreConfig.Modules.EdgeStream.TunnelServer = net.JoinHostPort(host, strconv.Itoa(constants.DefaultTunnelPort))
 
 	if len(opt.Labels) > 0 {
-		labelsMap := make(map[string]string)
-		for _, label := range opt.Labels {
-			arr := strings.SplitN(label, "=", 2)
-			if arr[0] == "" {
-				continue
-			}
-
-			if len(arr) > 1 {
-				labelsMap[arr[0]] = arr[1]
-			} else {
-				labelsMap[arr[0]] = ""
-			}
-		}
-		edgeCoreConfig.Modules.Edged.NodeLabels = labelsMap
+		edgeCoreConfig.Modules.Edged.NodeLabels = setEdgedNodeLabels(opt)
 	}
 
 	if errs := validation.ValidateEdgeCoreConfiguration(edgeCoreConfig); len(errs) > 0 {
 		return errors.New(pkgutil.SpliceErrors(errs.ToAggregate().Errors()))
 	}
 	return common.Write2File(configFilePath, edgeCoreConfig)
+}
+
+func createV1alpha1EdgeConfigFiles(opt *common.JoinOptions) error {
+	var edgeCoreConfig *v1alpha1.EdgeCoreConfig
+
+	configFilePath := filepath.Join(util.KubeEdgePath, "config/edgecore.yaml")
+	_, err := os.Stat(configFilePath)
+	if err == nil || os.IsExist(err) {
+		klog.Infoln("Read existing configuration file")
+		b, err := os.ReadFile(configFilePath)
+		if err != nil {
+			return err
+		}
+		if err := yaml.Unmarshal(b, &edgeCoreConfig); err != nil {
+			return err
+		}
+	}
+	if edgeCoreConfig == nil {
+		klog.Infoln("The configuration does not exist or the parsing fails, and the default configuration is generated")
+		edgeCoreConfig = v1alpha1.NewDefaultEdgeCoreConfig()
+	}
+
+	edgeCoreConfig.Modules.EdgeHub.WebSocket.Server = opt.CloudCoreIPPort
+	if opt.Token != "" {
+		edgeCoreConfig.Modules.EdgeHub.Token = opt.Token
+	}
+	if opt.EdgeNodeName != "" {
+		edgeCoreConfig.Modules.Edged.HostnameOverride = opt.EdgeNodeName
+	}
+	if opt.RuntimeType != "" {
+		edgeCoreConfig.Modules.Edged.RuntimeType = opt.RuntimeType
+	}
+
+	switch opt.CGroupDriver {
+	case v1alpha1.CGroupDriverSystemd:
+		edgeCoreConfig.Modules.Edged.CGroupDriver = v1alpha1.CGroupDriverSystemd
+	case v1alpha1.CGroupDriverCGroupFS:
+		edgeCoreConfig.Modules.Edged.CGroupDriver = v1alpha1.CGroupDriverCGroupFS
+	default:
+		return fmt.Errorf("unsupported CGroupDriver: %s", opt.CGroupDriver)
+	}
+	edgeCoreConfig.Modules.Edged.CGroupDriver = opt.CGroupDriver
+
+	if opt.RemoteRuntimeEndpoint != "" {
+		edgeCoreConfig.Modules.Edged.RemoteRuntimeEndpoint = opt.RemoteRuntimeEndpoint
+		edgeCoreConfig.Modules.Edged.RemoteImageEndpoint = opt.RemoteRuntimeEndpoint
+	}
+
+	host, _, err := net.SplitHostPort(opt.CloudCoreIPPort)
+	if err != nil {
+		return fmt.Errorf("get current host and port failed: %v", err)
+	}
+	if opt.CertPort != "" {
+		edgeCoreConfig.Modules.EdgeHub.HTTPServer = "https://" + net.JoinHostPort(host, opt.CertPort)
+	} else {
+		edgeCoreConfig.Modules.EdgeHub.HTTPServer = "https://" + net.JoinHostPort(host, "10002")
+	}
+	edgeCoreConfig.Modules.EdgeStream.TunnelServer = net.JoinHostPort(host, strconv.Itoa(constants.DefaultTunnelPort))
+
+	if len(opt.Labels) > 0 {
+		edgeCoreConfig.Modules.Edged.Labels = setEdgedNodeLabels(opt)
+	}
+
+	if errs := validationv1alpha1.ValidateEdgeCoreConfiguration(edgeCoreConfig); len(errs) > 0 {
+		return errors.New(pkgutil.SpliceErrors(errs.ToAggregate().Errors()))
+	}
+	return common.Write2File(configFilePath, edgeCoreConfig)
+}
+
+func setEdgedNodeLabels(opt *common.JoinOptions) map[string]string {
+	labelsMap := make(map[string]string)
+	for _, label := range opt.Labels {
+		arr := strings.SplitN(label, "=", 2)
+		if arr[0] == "" {
+			continue
+		}
+
+		if len(arr) > 1 {
+			labelsMap[arr[0]] = arr[1]
+		} else {
+			labelsMap[arr[0]] = ""
+		}
+	}
+	return labelsMap
 }
 
 func runEdgeCore() error {
@@ -317,4 +431,16 @@ func runEdgeCore() error {
 	klog.Infoln(cmd.GetStdOut())
 	klog.Infoln(tip)
 	return nil
+}
+
+func createBootstrapFile(opt *common.JoinOptions) error {
+	bootstrapFile := constants.BootstrapFile
+	_, err := os.Create(bootstrapFile)
+	if err != nil {
+		return err
+	}
+
+	// write token to bootstrap-edgecore.conf file
+	token := []byte(opt.Token)
+	return os.WriteFile(bootstrapFile, token, 0640)
 }

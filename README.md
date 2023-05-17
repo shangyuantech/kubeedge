@@ -53,17 +53,17 @@ KubeEdge consists of cloud part and edge part.
 - [EdgeHub](https://kubeedge.io/en/docs/architecture/edge/edgehub): a web socket client responsible for interacting with Cloud Service for the edge computing (like Edge Controller as in the KubeEdge Architecture). This includes syncing cloud-side resource updates to the edge, and reporting edge-side host and device status changes to the cloud.
 - [Edged](https://kubeedge.io/en/docs/architecture/edge/edged): an agent that runs on edge nodes and manages containerized applications.
 - [EventBus](https://kubeedge.io/en/docs/architecture/edge/eventbus): a MQTT client to interact with MQTT servers (mosquitto), offering publish and subscribe capabilities to other components.
-- [ServiceBus](https://kubeedge.io/en/docs/architecture/edge/servicebus): a HTTP client to interact with HTTP servers (REST), offering HTTP client capabilities to components of cloud to reach HTTP servers running at edge.
+- [ServiceBus](https://kubeedge.io/en/docs/architecture/edge/servicebus): an HTTP client to interact with HTTP servers (REST), offering HTTP client capabilities to components of cloud to reach HTTP servers running at edge.
 - [DeviceTwin](https://kubeedge.io/en/docs/architecture/edge/devicetwin): responsible for storing device status and syncing device status to the cloud. It also provides query interfaces for applications.
 - [MetaManager](https://kubeedge.io/en/docs/architecture/edge/metamanager): the message processor between edged and edgehub. It is also responsible for storing/retrieving metadata to/from a lightweight database (SQLite).
 
 ## Kubernetes compatibility
 
-|                        | Kubernetes 1.16 | Kubernetes 1.17 | Kubernetes 1.18 | Kubernetes 1.19 | Kubernetes 1.20 | Kubernetes 1.21 | Kubernetes 1.22 |
+|                        | Kubernetes 1.17 | Kubernetes 1.18 | Kubernetes 1.19 | Kubernetes 1.20 | Kubernetes 1.21 | Kubernetes 1.22 | Kubernetes 1.23 |
 |------------------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|
-| KubeEdge 1.10          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
-| KubeEdge 1.11          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
-| KubeEdge 1.12          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
+| KubeEdge 1.11          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | -               |
+| KubeEdge 1.12          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | -               |
+| KubeEdge 1.13          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
 | KubeEdge HEAD (master) | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
 
 Key:
@@ -127,7 +127,7 @@ A third party security audit of KubeEdge has been completed in July 2022. Additi
 
 We encourage security researchers, industry organizations and users to proactively report suspected vulnerabilities to our security team (`cncf-kubeedge-security@lists.cncf.io`), the team will help diagnose the severity of the issue and determine how to address the issue as soon as possible.
 
-For further details please see [Security Policy](https://github.com/kubeedge/community/blob/master/security-team/SECURITY.md) for our security process and how to report vulnerabilities.
+For further details please see [Security Policy](https://github.com/kubeedge/community/blob/master/team-security/SECURITY.md) for our security process and how to report vulnerabilities.
 
 ## License
 

@@ -38,10 +38,24 @@ type CloudCoreConfig struct {
 	FeatureGates map[string]bool `json:"featureGates,omitempty"`
 }
 
-// KubeAPIConfig indicates the configuration for interacting with k8s server
+// CommonConfig indicates common config for all modules
 type CommonConfig struct {
 	// TunnelPort indicates the port that the cloudcore tunnel listened
 	TunnelPort int `json:"tunnelPort,omitempty"`
+
+	// MonitorServer holds config that exposes prometheus metrics and pprof
+	MonitorServer MonitorServer `json:"monitorServer,omitempty"`
+}
+
+// MonitorServer indicates MonitorServer config
+type MonitorServer struct {
+	// BindAddress is the IP address and port for the monitor server to serve on,
+	// defaulting to 127.0.0.1:9091 (set to 0.0.0.0 for all interfaces)
+	BindAddress string `json:"bindAddress,omitempty"`
+
+	// EnableProfiling enables profiling via web interface on /debug/pprof handler.
+	// Profiling handlers will be handled by monitor server.
+	EnableProfiling bool `json:"enableProfiling,omitempty"`
 }
 
 // KubeAPIConfig indicates the configuration for interacting with k8s server
@@ -99,7 +113,7 @@ type CloudHub struct {
 	// KeepaliveInterval indicates keep-alive interval (second)
 	// default 30
 	KeepaliveInterval int32 `json:"keepaliveInterval,omitempty"`
-	// NodeLimit indicates node limit
+	// NodeLimit is a maximum number of edge node that can connect to the single CloudCore
 	// default 1000
 	NodeLimit int32 `json:"nodeLimit,omitempty"`
 	// TLSCAFile indicates ca file path

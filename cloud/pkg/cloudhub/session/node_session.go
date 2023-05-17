@@ -440,21 +440,12 @@ func (ns *NodeSession) saveSuccessPoint(msg *beehivemodel.Message) {
 				return
 			}
 
-			_, err := ns.reliableClient.
+			objectSyncStatus, err := ns.reliableClient.
 				ReliablesyncsV1alpha1().
 				ObjectSyncs(resourceNamespace).
 				Create(context.Background(), objectSync, metav1.CreateOptions{})
 			if err != nil {
 				klog.Errorf("Failed to create objectSync: %s, err: %v", objectSyncName, err)
-				return
-			}
-
-			objectSyncStatus, err := ns.reliableClient.
-				ReliablesyncsV1alpha1().
-				ObjectSyncs(resourceNamespace).
-				Get(context.Background(), objectSyncName, metav1.GetOptions{})
-			if err != nil {
-				klog.Errorf("Failed to get objectSync: %s, err: %v", objectSyncName, err)
 				return
 			}
 
@@ -483,7 +474,7 @@ func (ns *NodeSession) deleteSuccessPoint(resourceNamespace, objectSyncName stri
 		ReliablesyncsV1alpha1().
 		ObjectSyncs(resourceNamespace).
 		Delete(context.Background(), objectSyncName, *metav1.NewDeleteOptions(0))
-	if err != nil {
+	if err != nil && !apierrors.IsNotFound(err) {
 		klog.Errorf("Delete ObjectSync %s error: %v", objectSyncName, err)
 	}
 
